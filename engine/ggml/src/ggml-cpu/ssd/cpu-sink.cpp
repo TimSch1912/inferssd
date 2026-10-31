@@ -3316,6 +3316,9 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     // Stufe 2 (31.10.2026): 50 us aktives Warten zwischen Sink-Phasen, +4 % Decode (zwei Läufe); 0 = Upstream-Verhalten
     p.poll_us = 50;
     if (const char * v = std::getenv("INFERSSD_EXP_POLL_US")) { p.poll_us = std::atoi(v); }
+    // Reihe 8 (31.10.2026): beide an = 8,60 statt 8,37 tok/s, gleichwertige Ausgabe; mit =0 abschaltbar
+    p.io_overlap = true;
+    p.demand_first = true;
     if (const char * v = std::getenv("INFERSSD_EXP_IO_OVERLAP")) { p.io_overlap = std::strcmp(v, "1") == 0; }
     if (const char * v = std::getenv("INFERSSD_EXP_DEMAND_FIRST")) { p.demand_first = std::strcmp(v, "1") == 0; }
     p.decode_participants = int(participants);
