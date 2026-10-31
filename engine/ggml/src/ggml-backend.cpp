@@ -1751,6 +1751,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     } seeds{sched};
 
+    static const bool async_copies_enabled = [] {
+        const char * value = getenv("INFERSSD_EXP_ASYNC_COPIES");
+        return value && strcmp(value, "1") == 0;
+    }();
+    ggml_backend_t async_backend = nullptr;
+    // ponytail: only one CUDA stream and a synchronous CPU; other topologies
+    // keep the existing copy/event path until they have lifetime coverage.
+    if (async_copies_enabled && sched->n_backends == 2 && sched->n_copies == 1 && !sched->callback_eval &&
+        !sched->backends[1]->iface.synchronize) {
+        ggml_backend_t backend = sched->backends[0];
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend->device);
+        if (reg && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 &&
+            backend->iface.get_tensor_async && backend->iface.set_tensor_async && backend->iface.synchronize) {
+            async_backend = backend;
+        }
+    }
+    struct async_copy_guard {
+        ggml_backend_t backend = nullptr;
+        void wait() {
+            if (backend) {
+                ggml_backend_synchronize(backend);
+                backend = nullptr;
+            }
+        }
+        // Also drain on failure/return, before graph allocations can be reused.
+        ~async_copy_guard() { wait(); }
+    } async_copies;
+
     ggml_tensor * prev_ids_tensor = nullptr;
     int64_t prev_ids_n_expert = -1;
     std::vector<int32_t> ids;
@@ -1760,11 +1788,50 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        bool batch_get = async_backend && split_backend != async_backend;
+        if (batch_get) {
+            // Preflight the entire batch: a synchronous fallback could write a
+            // host allocation that a previous H2D copy is still reading.
+            for (int i = 0; i < split->n_inputs; ++i) {
+                ggml_tensor * input = split->inputs[i];
+                ggml_tensor * copy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                ggml_backend_buffer_t buffer = input->view_src ? input->view_src->buffer : input->buffer;
+                if ((input->flags & GGML_TENSOR_FLAG_INPUT) ||
+                    ggml_backend_sched_get_tensor_backend(sched, input) != async_backend ||
+                    buffer->buft != ggml_backend_get_default_buffer_type(async_backend) ||
+                    buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                    !ggml_backend_buffer_is_host(copy->buffer) || !ggml_are_same_layout(input, copy)) {
+                    batch_get = false;
+                    break;
+                }
+            }
+        }
+        if (async_backend && split_backend != async_backend && !batch_get) {
+            async_copies.wait();
+        }
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            if (batch_get) {
+                ggml_backend_tensor_get_async(async_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                async_copies.backend = async_backend;
+                continue;
+            }
+            if (async_backend && split_backend == async_backend &&
+                !(input->flags & GGML_TENSOR_FLAG_INPUT) && input_backend == sched->backends[1] &&
+                ggml_backend_buffer_is_host(input->buffer) &&
+                input->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                input_cpy->buffer->buft == ggml_backend_get_default_buffer_type(async_backend) &&
+                ggml_are_same_layout(input, input_cpy)) {
+                // CPU compute is complete. Prior uses of the CUDA destination,
+                // this H2D copy and the next CUDA graph share the same stream.
+                ggml_backend_tensor_set_async(async_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                async_copies.backend = async_backend;
+                continue;
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1887,6 +1954,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (batch_get) {
+            // One wait completes all D2H inputs AND earlier H2D reads before
+            // the CPU/allocator can overwrite any of their host storage.
+            async_copies.wait();
+        }
         if (sched->ssd_hooks && !sched->ssd_hooks->fence(sched->ssd_userdata, split_backend)) {
             return GGML_STATUS_FAILED;
         }

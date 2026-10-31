@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -21,6 +22,11 @@ struct separate_domain {
     ggml_backend backend = {};
     unsigned allocations = 0, scratch_reserves = 0;
     bool fail_allocation = false, fail_scratch = false;
+    ggml_backend_reg reg = {};
+    std::vector<std::function<void()>> pending;
+    std::vector<unsigned> get_batches;
+    unsigned async_gets = 0, async_sets = 0, gets_since_wait = 0, waits = 0;
+    unsigned compute_calls = 0, fail_compute_at = 0;
 
     separate_domain() {
         type.context = this;
@@ -65,6 +71,48 @@ struct separate_domain {
             const auto status = ggml_graph_compute_with_ctx(context, graph, 1);
             ggml_free(context);
             return status;
+        };
+    }
+
+    void enable_async() {
+        // Emulate CUDA's stream on host memory: no transfer or graph runs until
+        // synchronize. This exposes missing fences without touching a GPU.
+        reg.iface.get_name = [](ggml_backend_reg_t) { return "CUDA"; };
+        device.reg = &reg;
+        backend.iface.get_tensor_async = [](ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t bytes) {
+            auto & domain = *static_cast<separate_domain *>(backend->context);
+            ++domain.async_gets;
+            ++domain.gets_since_wait;
+            domain.pending.emplace_back([=] { std::memcpy(data, static_cast<const char *>(tensor->data) + offset, bytes); });
+        };
+        backend.iface.set_tensor_async = [](ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t bytes) {
+            auto & domain = *static_cast<separate_domain *>(backend->context);
+            ++domain.async_sets;
+            const auto * begin = static_cast<const char *>(data);
+            std::vector<char> snapshot(begin, begin + bytes);
+            domain.pending.emplace_back([=] {
+                require(std::memcmp(data, snapshot.data(), bytes) == 0, "host allocation overwritten before H2D completion");
+                std::memcpy(static_cast<char *>(tensor->data) + offset, data, bytes);
+            });
+        };
+        backend.iface.synchronize = [](ggml_backend_t backend) {
+            auto & domain = *static_cast<separate_domain *>(backend->context);
+            ++domain.waits;
+            if (domain.gets_since_wait) { domain.get_batches.push_back(domain.gets_since_wait); }
+            domain.gets_since_wait = 0;
+            for (auto & operation : domain.pending) { operation(); }
+            domain.pending.clear();
+        };
+        backend.iface.graph_compute = [](ggml_backend_t backend, ggml_cgraph * graph) {
+            auto & domain = *static_cast<separate_domain *>(backend->context);
+            if (++domain.compute_calls == domain.fail_compute_at) { return GGML_STATUS_FAILED; }
+            domain.pending.emplace_back([=] {
+                auto * context = ggml_init({1 << 20, nullptr, false});
+                const auto status = ggml_graph_compute_with_ctx(context, graph, 1);
+                ggml_free(context);
+                require(status == GGML_STATUS_SUCCESS, "queued graph failed");
+            });
+            return GGML_STATUS_SUCCESS;
         };
     }
 };
@@ -171,9 +219,90 @@ static void invalidation_and_failure() {
     }
 }
 
+static void asynchronous_copies(bool parallel = false, bool callback = false, bool fail = false, bool mixed = false) {
+    executor executor(parallel);
+    executor.domain.enable_async();
+    auto * sched = executor.scheduler.get();
+    ggml_backend_sched_set_auto_reserve(sched, true);
+    auto & domain = executor.domain;
+    auto * context = ggml_init({1 << 20, nullptr, true});
+    auto * x = ggml_new_tensor_1d(context, GGML_TYPE_F32, 16);
+    ggml_set_input(x);
+    ggml_backend_sched_set_tensor_backend(sched, x, executor.cpu.get());
+    ggml_tensor * value = x;
+    auto sum = +[](ggml_tensor * dst, int ith, int, void *) {
+        if (ith) { return; }
+        for (int i = 0; i < 16; ++i) {
+            static_cast<float *>(dst->data)[i] = static_cast<const float *>(dst->src[0]->data)[i] +
+                                               static_cast<const float *>(dst->src[1]->data)[i];
+        }
+    };
+    // Repeated crossings let the real allocator recycle earlier CPU results.
+    for (int layer = 0; layer < 3; ++layer) {
+        auto * a = ggml_scale(context, value, 2);
+        auto * b = ggml_scale(context, value, 3);
+        ggml_backend_sched_set_tensor_backend(sched, a, &domain.backend);
+        ggml_backend_sched_set_tensor_backend(sched, b, &domain.backend);
+        // A flagged input makes the whole batch use the legacy path, draining
+        // preceding uploads before copies can overwrite recycled host storage.
+        if (mixed && layer == 1) { ggml_set_input(b); }
+        ggml_tensor * args[] = {a, b};
+        value = ggml_custom_4d(context, GGML_TYPE_F32, 16, 1, 1, 1, args, 2, sum, 1, nullptr);
+        ggml_backend_sched_set_tensor_backend(sched, value, executor.cpu.get());
+    }
+    auto * output = ggml_scale(context, value, 2);
+    ggml_set_output(output);
+    ggml_backend_sched_set_tensor_backend(sched, output, &domain.backend);
+    auto * graph = ggml_new_graph_custom(context, 128, false);
+    ggml_build_forward_expand(graph, output);
+    if (callback) {
+        ggml_backend_sched_set_eval_callback(sched, [](ggml_tensor *, bool, void *) { return true; }, nullptr);
+    }
+    require(ggml_backend_sched_alloc_graph(sched, graph), "async graph allocation failed");
+    static const bool requested = [] {
+        const char * env = std::getenv("INFERSSD_EXP_ASYNC_COPIES");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    const bool enabled = requested && !parallel && !callback;
+    for (int iteration = 1; iteration <= 2; ++iteration) {
+        std::array<float, 16> input, result;
+        input.fill(float(iteration));
+        ggml_backend_tensor_set(x, input.data(), 0, sizeof(input));
+        domain.async_gets = domain.async_sets = domain.gets_since_wait = domain.waits = 0;
+        domain.get_batches.clear();
+        domain.compute_calls = 0;
+        domain.fail_compute_at = fail ? 2 : 0; // Fail after queuing the first CPU result's H2D.
+        const auto status = ggml_backend_sched_graph_compute_async(sched, graph);
+        require(status == (fail ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS), "unexpected async copy graph status");
+        if (enabled) {
+            require(domain.pending.empty(), "async copies escaped graph lifetime guard");
+            require(domain.async_sets == (fail ? 1u : 3u), "CPU results did not use async H2D");
+            if (!mixed && !fail) {
+                require(domain.get_batches == std::vector<unsigned>({2, 2, 2}), "D2H inputs were not batched");
+                require(domain.waits == 5, "extra host sync between H2D and CUDA compute");
+            }
+        } else {
+            require(domain.async_gets == 0 && domain.async_sets == 0, "unsupported/disabled case left legacy path");
+        }
+        ggml_backend_sched_synchronize(sched);
+        if (fail) { continue; }
+        ggml_backend_tensor_get(output, result.data(), 0, sizeof(result));
+        for (float actual : result) { require(actual == float(250 * iteration), "async copy numerics changed"); }
+    }
+    ggml_backend_sched_reset(sched);
+    ggml_free(context);
+}
+
 int main() {
     try {
         numerical(false); numerical(true); invalidation_and_failure();
-        std::cout << "prepared graph: three real copy splits, CPU custom math, parallel copies, reset/storage/scratch refusal passed\n";
+        asynchronous_copies(); asynchronous_copies(true); asynchronous_copies(false, true);
+        asynchronous_copies(false, false, false, true);
+        asynchronous_copies(false, false, true);
+        // Changing the environment after first use must not switch code paths.
+        const char * env = std::getenv("INFERSSD_EXP_ASYNC_COPIES");
+        setenv("INFERSSD_EXP_ASYNC_COPIES", env && std::strcmp(env, "1") == 0 ? "0" : "1", 1);
+        asynchronous_copies();
+        std::cout << "prepared graph: scheduler copies, async batches/lifetimes/fallbacks/failure, parallel copies and reservation checks passed\n";
     } catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }
 }
