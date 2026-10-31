@@ -371,6 +371,8 @@ struct tier {
         if(!(miss>0) || !(upload>0))return;
         const double saved=miss-hit;
         table->admission_hits=saved>0?upload/saved:1e9;
+        // Versuchsschalter (Fork TimSch1912/inferssd, Stufe 2): Aufnahme strenger (>1) oder großzügiger (<1); ohne Variable unverändert
+        if(const char*f=std::getenv("INFERSSD_EXP_ADMIT_FACTOR")){const double k=std::atof(f);if(k>0&&saved>0)table->admission_hits*=k;}
         table->refresh_expected();
         const double before=last_min_count,next=table->admission_count();
         last_min_count=next;adaptive_admission=true;++admission_updates;
@@ -2669,6 +2671,7 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
         options.deferred_upload = options.global = options.count_policy = options.adaptive_admission = true;
         options.min_count = 2.5;
         options.half_life = 16;
+        if (const char * h = std::getenv("INFERSSD_EXP_HALF_LIFE")) { options.half_life = std::atof(h); }  // Versuchsschalter, 1..64
         if (services && services->debug) {
             const auto debug = *services->debug;
             options.memory_trace = debug.ledger;

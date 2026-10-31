@@ -3285,6 +3285,9 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     auto & p = out.policy;
     p.ready_first = p.early_up_gate = p.role_major = p.nonblocking_down_sched = p.dynamic_rows = true;
     p.dynamic_chunk_rows = 64;
+    // Versuchsschalter (Fork TimSch1912/inferssd, Stufe-2-Messungen): ohne Variable unverändert
+    if (const char * v = std::getenv("INFERSSD_EXP_CHUNK_ROWS")) { p.dynamic_chunk_rows = std::atoi(v); }
+    if (const char * v = std::getenv("INFERSSD_EXP_POLL_US")) { p.poll_us = std::atoi(v); }
     p.decode_participants = int(participants);
     p.prefetch_depth = int(prefetch);
     for (uint32_t cpu : *out.settings.cpus("cpu.io_cpus")) { p.io_cpus.push_back(int(cpu)); }
