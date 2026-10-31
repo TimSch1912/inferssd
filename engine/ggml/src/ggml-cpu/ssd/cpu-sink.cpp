@@ -3287,6 +3287,8 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     p.dynamic_chunk_rows = 64;
     // Versuchsschalter (Fork TimSch1912/inferssd, Stufe-2-Messungen): ohne Variable unverändert
     if (const char * v = std::getenv("INFERSSD_EXP_CHUNK_ROWS")) { p.dynamic_chunk_rows = std::atoi(v); }
+    // Stufe 2 (31.10.2026): 50 us aktives Warten zwischen Sink-Phasen, +4 % Decode (zwei Läufe); 0 = Upstream-Verhalten
+    p.poll_us = 50;
     if (const char * v = std::getenv("INFERSSD_EXP_POLL_US")) { p.poll_us = std::atoi(v); }
     p.decode_participants = int(participants);
     p.prefetch_depth = int(prefetch);

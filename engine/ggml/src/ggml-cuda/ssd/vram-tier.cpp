@@ -2670,7 +2670,8 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
         options.async_upload = options.keep_across_requests = options.elastic = options.demand_reclaim = true;
         options.deferred_upload = options.global = options.count_policy = options.adaptive_admission = true;
         options.min_count = 2.5;
-        options.half_life = 16;
+        // Stufe 2 (31.10.2026): 32 statt 16 Token Halbwertszeit, −30 % VRAM-Uploads bei gleichen Treffern, +8 % Decode
+        options.half_life = 32;
         if (const char * h = std::getenv("INFERSSD_EXP_HALF_LIFE")) { options.half_life = std::atof(h); }  // Versuchsschalter, 1..64
         if (services && services->debug) {
             const auto debug = *services->debug;
