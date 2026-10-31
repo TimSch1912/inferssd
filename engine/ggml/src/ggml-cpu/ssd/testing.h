@@ -16,6 +16,7 @@ namespace testing {
 struct execution_policy {
     bool ready_first = false, early_up_gate = false, role_major = false;
     bool nonblocking_down_sched = false, dynamic_rows = false, read_fixed = false;
+    bool io_overlap = false, demand_first = false;
     int poll_us = 0, dynamic_chunk_rows = 64;
     std::vector<double> row_weights; // one per participant of each run
     std::vector<int> io_cpus;

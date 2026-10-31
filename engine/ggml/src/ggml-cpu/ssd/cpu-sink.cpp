@@ -570,6 +570,7 @@ struct kimi_cpu_sink {
         // The only field a run's scheduler reads without the prefetch mutex: 0 while the reads may still complete,
         // 1 once all three roles are read, 2 once the job cannot complete (a read failed or a role was dropped).
         std::atomic<int> state{0};
+        std::atomic<bool> cancel{false}; // stop unused prefetches between direct-read chunks
     };
     struct prefetch_state {
         int topk = 0;
@@ -769,6 +770,9 @@ struct kimi_cpu_sink {
         if (configuration.policy.prefetch_depth && (!ready_first || !nonblocking_down_sched)) {
             throw std::runtime_error("next-layer prefetch requires the ordered nonblocking scheduler");
         }
+        if (configuration.policy.io_overlap && !nonblocking_down_sched) {
+            throw std::runtime_error("I/O overlap requires the ordered nonblocking scheduler");
+        }
         for (double value : row_weights) {
             if (!std::isfinite(value) || value <= 0) { throw std::runtime_error("invalid explicit row weight"); }
         }
@@ -912,7 +916,11 @@ struct kimi_cpu_sink {
             bool ok = !inject;
             size_t done = 0;
             while (ok && done < source.nbytes) {
-                const int64_t got = ssd::platform::pread_some(source.fd_direct, target + done, source.nbytes - done,
+                if (configuration.policy.demand_first && job.cancel.load()) { break; }
+                // ponytail: bound uncancellable device work; keep the slot inflight until the reader returns.
+                const size_t bytes = configuration.policy.demand_first ?
+                    std::min(source.nbytes - done, size_t(1) << 20) : source.nbytes - done;
+                const int64_t got = ssd::platform::pread_some(source.fd_direct, target + done, bytes,
                     source.offset + done);
                 if (got <= 0) { ok = false; break; }
                 done += size_t(got);
@@ -921,7 +929,8 @@ struct kimi_cpu_sink {
             lock.lock();
             if (self.spill) { prefetch_end_spill(self, sink_clock::now()); }
             self.job = nullptr;
-            if (ok) { ++job.done; } else { job.failed = true; }
+            const size_t required = source.payload_nbytes ? source.data_offset + source.payload_nbytes : source.nbytes;
+            if (ok && done >= required) { ++job.done; } else if (!ok) { job.failed = true; }
             prefetch.reader_bytes += done;
             if (!--prefetch.running) { prefetch.reader_busy_us += elapsed_us(prefetch.busy_since); }
             --job.running;
@@ -982,6 +991,7 @@ struct kimi_cpu_sink {
         prefetch.gate_open = false;
         auto needed = [&](const prefetch_job & job) {
             if (!ids || job.layer != layer || job.failed) { return false; }
+            if (configuration.policy.demand_first && job.cancel.load()) { return false; }
             for (int i = 0; i < nids; ++i) { if (ids[i] == job.expert && !held[i]) { return true; } }
             return false;
         };
@@ -1006,6 +1016,11 @@ struct kimi_cpu_sink {
                 }
             }
             prefetch.pending.reserve(prefetch.jobs.size());
+            if (configuration.policy.demand_first) {
+                // Selected CPU prefetches are demand reads now. Cancel only unused jobs; queued roles are
+                // dropped below, running roles stop at the next chunk boundary without releasing their slots.
+                for (auto & job : prefetch.jobs) { if (!needed(*job)) { job->cancel.store(true); } }
+            }
             for (auto * q : { &prefetch.urgent, &prefetch.queue }) {
                 for (const auto & item : *q) {
                     if (!needed(*item.first)) { --item.first->queued; prefetch_settle(*item.first); }
@@ -2582,6 +2597,17 @@ struct kimi_cpu_sink {
             {
                 std::unique_lock<std::mutex> lock(io_mutex);
                 auto choose = [&] {
+                    if (configuration.policy.io_overlap) {
+                        // Finish resident experts while SSD reads run. Pending prefetch hits are not resident yet.
+                        for (size_t i = 0; i < requests.size(); ++i) {
+                            const auto & r = requests[i];
+                            if (expert_stage[i] == 2 || r.cache_hit < 0 || prefetch_hit_state(r.cache_hit) != 1) { continue; }
+                            expert = i;
+                            work = expert_stage[i] == 1 ? down_work : planned(i) ? gpu_work : up_gate_work;
+                            upload_source_complete = true;
+                            return;
+                        }
+                    }
                     // Up/gate work always wins. Fully ready experts do not
                     // preempt a partial expert, because neither choice blocks.
                     for (size_t i = 0; i < requests.size(); ++i) {
@@ -3290,6 +3316,8 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     // Stufe 2 (31.10.2026): 50 us aktives Warten zwischen Sink-Phasen, +4 % Decode (zwei Läufe); 0 = Upstream-Verhalten
     p.poll_us = 50;
     if (const char * v = std::getenv("INFERSSD_EXP_POLL_US")) { p.poll_us = std::atoi(v); }
+    if (const char * v = std::getenv("INFERSSD_EXP_IO_OVERLAP")) { p.io_overlap = std::strcmp(v, "1") == 0; }
+    if (const char * v = std::getenv("INFERSSD_EXP_DEMAND_FIRST")) { p.demand_first = std::strcmp(v, "1") == 0; }
     p.decode_participants = int(participants);
     p.prefetch_depth = int(prefetch);
     for (uint32_t cpu : *out.settings.cpus("cpu.io_cpus")) { p.io_cpus.push_back(int(cpu)); }
@@ -3570,6 +3598,19 @@ extern "C" bool kimi_cpu_sink_run_activation(
             for (auto & t : sink->timeline) { t.workers.resize(2 * size_t(sink->threads)); }
             sink->timeline_call[1] = ggml_time_us();
         }
+        auto start_reads = [&] {
+            sink->plan.start = sink_clock::now();
+            {
+                std::lock_guard<std::mutex> lock(sink->io_mutex);
+                sink->io_error.clear();
+                sink->io_cancel = false;
+                if (sink->timeline_active) { sink->timeline_call[3] = ggml_time_us(); }
+                if (!sink->io_requests.empty()) { sink->io_done = false; sink->io_job = true; }
+            }
+            sink->io_cv.notify_one();
+        };
+        // prepare() has pinned hits and reserved every read target; quantization and the VRAM launch use no weights.
+        if (sink->configuration.policy.io_overlap) { start_reads(); }
         sink->output = output;
         auto compute_start = sink_clock::now();
         double quant_cpu_start = sink->profile_enabled ? sink_thread_cpu_us() : 0.0;
@@ -3581,15 +3622,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
         sink->vram.launch(sink->quant_input.data(), sink->quant_input.size(), input,
                           size_t(sink->latent) * sizeof(float), *activation);
         if (sink->timeline_active) { sink->timeline_call[2] = ggml_time_us(); }
-        sink->plan.start = sink_clock::now();
-        {
-            std::lock_guard<std::mutex> lock(sink->io_mutex);
-            sink->io_error.clear();
-            sink->io_cancel = false;
-            if (sink->timeline_active) { sink->timeline_call[3] = ggml_time_us(); }
-            if (!sink->io_requests.empty()) { sink->io_done = false; sink->io_job = true; }
-        }
-        sink->io_cv.notify_one();
+        if (!sink->configuration.policy.io_overlap) { start_reads(); }
         sink->prefetch_schedule(up, !sink->io_requests.empty());
         // The plan reads nothing the reads change (its landing times start at plan.start): planned once they run.
         sink->plan_decode_layer();

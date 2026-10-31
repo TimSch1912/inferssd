@@ -92,6 +92,7 @@ struct fixture_inputs {
         const std::string key = value.substr(0, equal);
         static const char * recognized[] = {
             "ready_first", "early_up_gate", "role_major", "nonblocking_down_sched",
+            "io_overlap", "demand_first",
             "dynamic_rows", "read_fixed", "poll_us", "dynamic_chunk_rows", "row_weights",
             "io_cpus", "decode_participants", "prefetch_depth", "prefetch_fail_every", "prefetch_throw_drain",
             "prefetch_throw_schedule", "cache_policy", "cache_allocation", "cache_keep", "cache_prefill_read",
@@ -187,6 +188,7 @@ struct fixture_inputs {
 #define FIXTURE_INT(field) out.field = integer(#field, out.field)
         FIXTURE_BOOL(ready_first); FIXTURE_BOOL(early_up_gate); FIXTURE_BOOL(role_major);
         FIXTURE_BOOL(nonblocking_down_sched); FIXTURE_BOOL(dynamic_rows); FIXTURE_BOOL(read_fixed);
+        FIXTURE_BOOL(io_overlap); FIXTURE_BOOL(demand_first);
         FIXTURE_BOOL(cache_keep); FIXTURE_BOOL(cache_prefill_read); FIXTURE_BOOL(cache_elastic);
         FIXTURE_BOOL(cache_partial_reclaim); FIXTURE_BOOL(cache_reclaimable_file);
         FIXTURE_BOOL(vram_async); FIXTURE_BOOL(vram_exclusive); FIXTURE_BOOL(vram_deferred);

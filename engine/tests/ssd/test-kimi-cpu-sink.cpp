@@ -892,7 +892,7 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
         "io_cpus",
         "early_up_gate", "poll_us",
         "role_major", "nonblocking_down_sched",
-        "dynamic_rows", "dynamic_chunk_rows" };
+        "dynamic_rows", "dynamic_chunk_rows", "io_overlap" };
     std::map<std::string, std::string> original;
     for (const char * name : names) { if (inputs.get(name)) { original[name] = inputs.get(name); } }
     // The sink pins only its own I/O threads (modes 6 and 7, on one CPU); its compute participants are the
@@ -901,7 +901,8 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
     std::string weighted;
     for (int i = 0; i < threads - 1; ++i) { weighted += std::string(i ? "," : "") + (i < 4 ? "1" : "0.6"); }
     // Preserve original ordinary schedule IDs, independently of vector indices.
-    const std::vector<int> mode_ids = schedules ? std::vector<int>{ 0, 1, 6, 7 } : std::vector<int>{ 0, 1 };
+    const std::vector<int> mode_ids = schedules ? std::vector<int>{ 0, 1, 6, 7 } :
+        nonblocking_down_sched ? std::vector<int>{ 0, 1, 2 } : std::vector<int>{ 0, 1 };
     const int modes = int(mode_ids.size());
     std::vector<sink_ptr> sinks;
     std::vector<bool> ready(modes, false);
@@ -914,6 +915,7 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
         const bool dynamic = schedules ? mode >= 7 : nonblocking_down_sched && mode;
         inputs.set(names[7], dynamic ? "1" : "0");
         inputs.set(names[8], "16");
+        inputs.set(names[9], nonblocking_down_sched && mode == 2 ? "1" : "0");
         if (schedules) {
             ready[index] = mode == 1 || mode == 7;
             inputs.set(names[0], ready[index] ? "1" : "0");
@@ -1017,6 +1019,15 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
         }
         small.fault = fixture::none; small.fault_expert = small.fault_role = -1;
         check("job_short_read_recovery", small, { 3, 7, 8 }, { .2f, .3f, .5f }, 0);
+    }
+    if (nonblocking_down_sched) {
+        fixture mxfp4; mxfp4.type = mxfp4.down_type = GGML_TYPE_MXFP4; make_synthetic(mxfp4);
+        reset(); check("overlap_mxfp4_warm", mxfp4, { 1, 3 }, { .4f, .6f }, 0);
+        check("overlap_mxfp4_mixed_duplicate", mxfp4, { 2, 1, 2, 4, 3 }, { .1f, .2f, .3f, .1f, .3f }, 2);
+        for (int id : { 1, 2, 3, 4 }) { check("overlap_mxfp4_expert", mxfp4, { id }, { 1 }, 1); }
+        check("overlap_mxfp4_negative_zero", mxfp4, { 1 }, { -0.0f }, 1);
+        reset();
+        selector.active = &small; // no sink keeps a resolver pointing at the destroyed fixture
     }
     std::printf("SCHEDULE_BIT_EXACT_OK threads=%d ring_experts=%d modes=%d early_up_gate=%d role_major=%d nonblocking_down_sched=%d poll_us=%d\n",
                 threads, depth, modes, early_up_gate, role_major, nonblocking_down_sched, poll);
@@ -2126,7 +2137,10 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
         // spill, and only they; the reads of 5 are that run's own
         const uint64_t spills = std::stoull(field("spills"));
         const std::string spill_r = field("spill_us_r");
-        require(field("started_r") == (read ? "1,1,0,0" : "0,0,0,0") && spills <= 3 && spill_r.rfind("0,", 0) == 0 &&
+        // The unused queued hint may be dropped before any reader starts it.
+        const std::string started = field("started_r");
+        require((read ? started == "1,1,0,0" || (started == "1,0,0,0" && !spills) : started == "0,0,0,0") &&
+                spills <= 3 && spill_r.rfind("0,", 0) == 0 &&
                 spill_r.substr(spill_r.find(',', 2)) == ",0,0" &&
                 (spills || (field("spill_us") == "0" && spill_r == "0,0,0,0")), "prefetch report spill: " + report);
         std::printf("case=prefetch_depth%d status=PASS %s\n", k, report.c_str());
@@ -2203,6 +2217,87 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
                 std::stoull(field(last, "spill_us_r").substr(2)) < 3 * 150000,
                 "reads spilled past a run without reads of its own and without a hint: " + last);
         std::printf("case=prefetch_spill_last status=PASS %s\n", last.c_str());
+    }
+    {
+        inputs.set("io_overlap", "1");
+        inputs.set("prefetch_depth", "0");
+        stderr_capture log;
+        {
+            auto sink = make_sink(inputs, f, threads, depth);
+            configure_cache(sink.get(), 4 * unit, { 1 }, 4);
+            begin_cache(sink.get(), 3, 1);
+            cache_case(inputs, "overlap_warm", f, sink.get(), 1, input, { 1, 3 }, { .4f, .6f }, 0, 2);
+            begin_cache(sink.get(), 3, 2);
+            cache_case(inputs, "overlap_resident_first", f, sink.get(), 1, input, { 2, 1, 4, 3 }, { .1f, .2f, .3f, .4f }, 2, 2);
+        }
+        std::istringstream lines(log.read());
+        std::string line;
+        nlohmann::json record;
+        const std::string prefix = "[kimi_cpu_sink_timeline] ";
+        while (std::getline(lines, line)) {
+            if (line.rfind(prefix, 0) == 0) { record = nlohmann::json::parse(line.substr(prefix.size())); }
+        }
+        require(!record.is_null() && record.at("t")[3] <= record.at("t")[2], "demand job started after quantization");
+        const auto & e = record.at("experts");
+        require(e[1]["cpu"][7] <= e[3]["cpu"][2] && e[3]["cpu"][7] <= e[0]["cpu"][2],
+                "resident experts did not finish before SSD experts");
+        std::printf("case=overlap_resident_first status=PASS\n");
+        inputs.unset("io_overlap");
+    }
+    {
+        // Hold the first read of every role. Closing the window must stop unused prefetches after one chunk,
+        // retain their inflight slots until return, and never publish a partial expert as a cache hit.
+        fixture big; big.latent = big.hidden = 2048; big.experts = 7; big.stored = { 0, 1, 2, 6 };
+        big.type = big.down_type = GGML_TYPE_MXFP4; make_synthetic(big);
+        const uint64_t big_unit = triplet_bytes(big), chunk = 1ull << 20;
+        std::vector<float> x(big.latent, .013f);
+        std::vector<uint64_t> offsets;
+        for (int role = 0; role < 3; ++role) { offsets.push_back(big.entries.at({ tensor_name(2, role), 6 }).offset); }
+        for (int mode : { 0, 1, 2 }) {
+            const bool enabled = mode != 0, selected = mode == 2;
+            inputs.set("demand_first", enabled ? "1" : "0");
+            inputs.set("prefetch_depth", "1");
+            stderr_capture log;
+            {
+                auto sink = make_sink(inputs, big, threads, depth);
+                pread_hold_guard hold(big.fd, offsets);
+                configure_cache(sink.get(), 4 * big_unit, { 1, 2 }, 2);
+                begin_cache(sink.get(), 2, 1);
+                for (int layer : { 1, 2 }) {
+                    cache_case(inputs, "demand_first_warm", big, sink.get(), layer, x, { 1, 2 }, { .4f, .6f }, 0, 2);
+                }
+                begin_cache(sink.get(), 2, 2);
+                const int32_t hint = 6;
+                kimi_cpu_sink_prefetch_hint(sink.get(), 2, &hint, 1);
+                cache_case(inputs, "demand_first_hint", big, sink.get(), 1, x, { 1, 2 }, { .4f, .6f }, 2, 0);
+                hold.wait(3);
+                if (selected) {
+                    auto & h = pread_hold::get();
+                    std::lock_guard<std::mutex> lock(h.mutex);
+                    h.before_meminfo = [&] { hold.release(); }; // prepare follows the drain's demand classification
+                }
+                cache_case(inputs, "demand_first_close", big, sink.get(), 2, x, { selected ? 6 : 2 }, { 1 }, 1, 0);
+                if (enabled && !selected) {
+                    // A later use cannot reactivate a cancelled prefetch, even while all its readers still run.
+                    const uint64_t valid = cache_snapshot(sink.get()).valid_bytes;
+                    cache_case(inputs, "demand_first_cancelled_selected_again", big, sink.get(), 2, x, { 6 }, { 1 }, 0, 0);
+                    require(cache_snapshot(sink.get()).valid_bytes == valid, "cancelled slot was reactivated while reading");
+                }
+                hold.release();
+                begin_cache(sink.get(), 2, 3); // drains the readers before their slots can be reused
+                cache_case(inputs, "demand_first_re_read", big, sink.get(), 2, x, { 6 }, { 1 },
+                    enabled && !selected ? 0 : 1, enabled && !selected ? 1 : 0);
+            }
+            const std::string report = log.read();
+            const std::string key = " reader_bytes=";
+            const size_t at = report.rfind(key);
+            require(at != std::string::npos && std::stoull(report.substr(at + key.size())) ==
+                    (enabled && !selected ? 3 * chunk : big_unit), "prefetch chunk cancellation/demand promotion failed");
+            require(report.find(enabled && !selected ? " cancelled=1 " : " cancelled=0 ") != std::string::npos,
+                    "partial prefetch was published or lost");
+            std::printf("case=demand_first_%d status=PASS\n", mode);
+        }
+        inputs.unset("demand_first");
     }
 #else
     std::printf("case=prefetch_spill_twice status=SKIP reason=linux_pread_interposition\n");
