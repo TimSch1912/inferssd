@@ -13,6 +13,7 @@ static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
+static constexpr uint32_t DSV4_STATE_MODE_EXACT    = 2;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
@@ -373,13 +374,17 @@ void llama_kv_cache_dsv4::state_write_until(llama_io_write_i & io, llama_seq_id 
 
     const uint32_t magic   = DSV4_STATE_MAGIC;
     const uint32_t version = DSV4_STATE_VERSION;
-    const uint32_t mode    = partial_only ? DSV4_STATE_MODE_PARTIAL : DSV4_STATE_MODE_FULL;
+    const bool exact_layout = flags & LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT;
+    if (exact_layout && (partial_only || seq_id < 0 || pos_last != kv_raw->seq_pos_max(seq_id))) {
+        throw std::runtime_error("exact DSv4 rollback requires the current full sequence state");
+    }
+    const uint32_t mode = partial_only ? DSV4_STATE_MODE_PARTIAL : exact_layout ? DSV4_STATE_MODE_EXACT : DSV4_STATE_MODE_FULL;
 
     io.write(&magic,   sizeof(magic));
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
 
-    if (seq_id >= 0) {
+    if (seq_id >= 0 && !exact_layout) {
         // The compressed state cannot be rolled back, so a restored sequence only continues after pos_last, and raw
         // cells that left the sliding window of that position are never attended to again: save only the window,
         // ~n_swa cells instead of everything the SWA cache still holds (up to n_swa + n_ubatch cells). Same layout
@@ -430,12 +435,13 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 
     io.read_to(&mode, sizeof(mode));
-    if (mode != DSV4_STATE_MODE_FULL && mode != DSV4_STATE_MODE_PARTIAL) {
+    if (mode != DSV4_STATE_MODE_FULL && mode != DSV4_STATE_MODE_PARTIAL && mode != DSV4_STATE_MODE_EXACT) {
         throw std::runtime_error("DSV4 state mode mismatch");
     }
 
     const bool partial_only = mode == DSV4_STATE_MODE_PARTIAL;
-    if (partial_only != !!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+    if (partial_only != !!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+        (mode == DSV4_STATE_MODE_EXACT) != !!(flags & LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT)) {
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 

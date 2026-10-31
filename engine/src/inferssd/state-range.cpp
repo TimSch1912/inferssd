@@ -3,6 +3,7 @@
 #include "llama-io.h"
 
 #include <vector>
+#include <stdexcept>
 
 bool llama_kv_cache::seq_has_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
@@ -31,7 +32,8 @@ bool llama_kv_cache::seq_has_range(llama_seq_id seq_id, llama_pos p0, llama_pos 
 }
 
 void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const {
-    GGML_UNUSED(flags);
+    const bool exact_layout = flags & LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT;
+    if (exact_layout && (seq_id < 0 || n_stream != 1)) { throw std::runtime_error("exact KV layout requires a sequence state"); }
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -73,12 +75,18 @@ void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_i
         GGML_ASSERT(cell_count == cell_count_check);
 
         io.write(&cell_count, sizeof(cell_count));
+        if (exact_layout) { io.write(&v_heads[s], sizeof(v_heads[s])); }
 
         // skip empty streams
         if (cell_count == 0) {
             continue;
         }
 
+        if (exact_layout) {
+            for (const auto & range : cr.data) {
+                for (uint32_t i = range.first; i < range.second; ++i) { io.write(&i,sizeof(i)); }
+            }
+        }
         state_write_meta(io, cr, seq_id);
         state_write_data(io, cr);
     }

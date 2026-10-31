@@ -34,7 +34,7 @@ struct reader : llama_io_read_i {
     size_t n_bytes() override { return pos; }
 };
 
-static void check(bool v41, int n) {
+static void check(bool v41, int n, llama_state_seq_flags flags) {
     llama_model model(llama_model_default_params());
     model.arch = v41 ? LLM_ARCH_DEEPSEEK41 : LLM_ARCH_LLAMA;
     auto & hp = model.hparams;
@@ -86,23 +86,32 @@ static void check(bool v41, int n) {
             }
         }
     }
-    writer before; kv.state_write(before, 0, 0);
+    writer before; kv.state_write(before, 0, flags);
+    if (v41 && n == 129 && flags == LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT) {
+        // DSV4 header (12), stream count (4), cell count (4), head (4), then physical indices.
+        for (const auto field : {std::pair<size_t,uint32_t>{20,1025}, {24,1024}, {28,0}}) {
+            auto corrupt = before.bytes; std::memcpy(corrupt.data()+field.first,&field.second,sizeof(field.second));
+            reader bad(corrupt); bool rejected = false;
+            try { kv.state_read(bad,0,flags); } catch (const std::runtime_error &) { rejected = true; }
+            require(rejected);
+        }
+    }
     // Suffix beyond pos_max is a no-op; fixed 4/128 trim ratios used to erase V4.1 metadata here.
     require(kv.seq_rm(0, n, -1));
-    writer trimmed; kv.state_write(trimmed, 0, 0); require(trimmed.bytes == before.bytes);
+    writer trimmed; kv.state_write(trimmed, 0, flags); require(trimmed.bytes == before.bytes);
     kv.clear(true);
-    reader in(before.bytes); kv.state_read(in, 0, 0);
+    reader in(before.bytes); kv.state_read(in, 0, flags);
     require(in.n_bytes() == before.bytes.size()); require(kv.seq_pos_max(0) == n - 1);
     for (const auto & s : saved) {
         std::vector<float> actual(s.values.size());
         ggml_backend_tensor_get(s.tensor, actual.data(), 0, actual.size()*sizeof(float));
         require(actual == s.values);
     }
-    writer after; kv.state_write(after, 0, 0); require(after.bytes == before.bytes);
-    std::printf("DSv4 state roundtrip ratios=%s tokens=%d bytes=%zu OK\n", v41 ? "2/1" : "4/128", n, before.bytes.size());
+    writer after; kv.state_write(after, 0, flags); require(after.bytes == before.bytes);
+    std::printf("DSv4 state roundtrip ratios=%s tokens=%d flags=%u bytes=%zu OK\n", v41 ? "2/1" : "4/128", n, flags, before.bytes.size());
 }
 int main() {
     ggml_backend_load_all();
-    try { for (bool v41 : {false, true}) { for (int n : {1, 2, 3, 127, 128, 129, 255, 256, 257, 385}) { check(v41, n); } } }
+    try { for (bool v41 : {false, true}) { for (int n : {1, 2, 3, 127, 128, 129, 255, 256, 257, 385}) { for (llama_state_seq_flags flags : {0u, unsigned(LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT)}) { check(v41, n, flags); } } } }
     catch (const std::exception & e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

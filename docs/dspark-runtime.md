@@ -41,7 +41,12 @@ Inferenz. Der erste Meilenstein verwendet genau einen Argmax-Vorschlag; die
 anderen Output-Heads und Confidence-Auswertung werden nicht berechnet. Ihre
 Hidden-Positionen nehmen weiterhin an allen drei Blöcken teil.
 
-Vor `[bekanntes Token, Draft]` entsteht ein vollständiger Sequenz-Snapshot.
+Vor `[bekanntes Token, Draft]` entsteht ein vollständiger Sequenz-Snapshot mit
+`LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT`. Er erhält sämtliche Raw-Zellen, deren
+physische Indizes und die Schreibköpfe. Ein reiner SWA-Ausschnitt mit anschließend
+neu belegten Zellen reicht für einen bitgleichen Folgeschritt nicht aus; der
+Realmodell-Canary deckt insbesondere die Grenze 128/129 ab. Das gewöhnliche
+Snapshotformat ohne dieses Flag bleibt unverändert.
 Der Hauptgraph berechnet beide Logitzeilen gemeinsam. Der Server restauriert
 anschließend **vor** Ziel-Sampling und RNG-Verbrauch und entscheidet mit
 sequentiellen Ziel-Logits. Ein Reject replayt nur die bekannte Eingabe; ein
@@ -79,6 +84,12 @@ ctest --test-dir build-linux-cuda -R '^(test-dsv4-state|test-dspark-quant|ssd_se
 
 `test-kimi-vram-format-compat` benötigt eine ausdrücklich verfügbare CUDA-GPU und
 prüft auch den Wechsel auf kleinere Expertmengen ohne neuen Cache/Engine.
+`test-dspark-state-model` ist ein manuell zu startender Realmodell-Canary. Mit
+festen CPU-Experten (`--ssd-vram-budget 0`) vergleicht er Folgelogits vor/nach
+Restore sowie nach einer verworfenen Zwei-Token-Batch an 127/128/129,
+255/256/257 und 4104 Positionen byteweise. Er benötigt Modell-/SSD-Argumente wie
+der Server und dieselbe Memory-cgroup.
+
 `tests/dspark_equivalence.py` zeichnet echte Token-IDs für Greedy, Fixed Seed
 mit Penalty und Grammar auf und vergleicht zwei Serverstarts exakt. Reale
 Server-/Benchmarkergebnisse stehen im zugehörigen Ergebnis-I-Laufprotokoll.

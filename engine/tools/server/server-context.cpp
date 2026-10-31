@@ -413,7 +413,7 @@ struct server_slot {
                     const auto n_tokens = prompt.tokens.size();
 
                     spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens, -1, -1,
-                        llama_model_has_mtp_sidecar(llama_get_model(ctx)) ? 0 : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        llama_model_has_mtp_sidecar(llama_get_model(ctx)) ? LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                     SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
                             spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
@@ -2258,7 +2258,7 @@ private:
             if (!row) { throw std::runtime_error("missing DSpark verifier logits"); }
             verifier.emplace_back(row,row+n_vocab);
         }
-        if (llama_state_seq_set_data_ext(slot.ctx,ckpt.data.data(),ckpt.size(),slot.id,0) != ckpt.size()) {
+        if (llama_state_seq_set_data_ext(slot.ctx,ckpt.data.data(),ckpt.size(),slot.id,LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT) != ckpt.size()) {
             throw std::runtime_error("failed full DSpark state restore");
         }
         const llama_pos pos0 = ckpt.pos_max+1;
@@ -3617,7 +3617,7 @@ private:
                 slot.t_spec_step_start_us = 0;
                 slot.t_spec_draft_ms = 0.0;
 
-                slot.n_decoded += ids.size();
+                if (!dspark) { slot.n_decoded += ids.size(); }
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
                 // update how many tokens out of those tested were accepted
@@ -3639,6 +3639,7 @@ private:
                 }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
+                    if (dspark) { ++slot.n_decoded; }
                     completion_token_output result = dspark ? std::move(dspark_outputs.at(i)) : completion_token_output{};
 
                     result.tok          = ids[i];

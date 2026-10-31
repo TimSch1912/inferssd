@@ -1998,7 +1998,8 @@ void llama_kv_cache::state_read_sinfo(
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in) {
-    GGML_UNUSED(flags);
+    const bool exact_layout = flags & LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT;
+    if (exact_layout && (seq_id < 0 || n_stream != 1)) { throw std::runtime_error("exact KV layout requires a single-stream sequence state"); }
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
@@ -2026,21 +2027,44 @@ const slot_info_vec_t *   sinfos_in) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         uint32_t cell_count;
         io.read_to(&cell_count, sizeof(cell_count));
+        const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
+        uint32_t saved_head = 0;
+        if (exact_layout) {
+            io.read_to(&saved_head,sizeof(saved_head));
+            if (saved_head > get_size()) { throw std::runtime_error("invalid exact KV allocation head"); }
+        }
 
         if (cell_count == 0) {
             // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
             if (sinfos_in && !(*sinfos_in)[s].empty()) {
                 throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
             }
+            if (exact_layout) { seq_rm(seq_id,-1,-1); v_heads[strm] = saved_head; }
             continue;
         }
 
-        const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
-
         slot_info sinfo;
+        slot_info saved_layout;
+        const slot_info * layout = sinfos_in ? &(*sinfos_in)[s] : nullptr;
+        if (exact_layout) {
+            if (seq_id < 0 || cell_count > get_size()) { throw std::runtime_error("exact KV layout requires a bounded sequence state"); }
+            saved_layout.s0 = saved_layout.s1 = strm;
+            saved_layout.resize(1); saved_layout.strm[0] = strm;
+            auto & indices = saved_layout.idxs[0]; indices.resize(cell_count);
+            std::vector<bool> seen(get_size(),false);
+            for (auto & index : indices) {
+                io.read_to(&index,sizeof(index));
+                if (index >= get_size() || seen[index]) { throw std::runtime_error("invalid exact KV cell index"); }
+                seen[index] = true;
+            }
+            if (layout && (layout->empty() || layout->idxs != saved_layout.idxs)) {
+                throw std::runtime_error("mirrored exact KV layout mismatch");
+            }
+            layout = &saved_layout;
+        }
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, layout);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2057,6 +2081,7 @@ const slot_info_vec_t *   sinfos_in) {
             throw std::runtime_error("failed to restore kv cache");
         }
 
+        if (exact_layout) { v_heads[strm] = saved_head; }
         if (sinfos_out) {
             (*sinfos_out)[s] = sinfo;
         }
