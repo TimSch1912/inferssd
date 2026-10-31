@@ -1801,9 +1801,12 @@ struct tier {
                 f.latent<=0 || f.hidden<=0 || f.latent>16384 || f.hidden>16384 ||
                 f.weight_type<0 || f.weight_type>=int(GGML_TYPE_COUNT) || f.down_type<0 || f.down_type>=int(GGML_TYPE_COUNT))
             throw std::runtime_error("invalid VRAM expert format");
+        // The owner reserves the largest expert key space. Equal-sized expert payloads from
+        // smaller layers (DSpark: 128, main: 384) share that engine and its single cache budget.
+        // Validate each request against its tensor's count, not the cache's key capacity.
         const bool mxfp4=f.weight_type==int(GGML_TYPE_MXFP4) && f.down_type==int(GGML_TYPE_MXFP4);
         if(engine && (!format_mode || latent!=f.latent || hidden!=f.hidden || weight_type!=f.weight_type ||
-                down_type!=f.down_type || n_experts!=f.n_experts))throw std::runtime_error("VRAM expert format changed");
+                down_type!=f.down_type || n_experts<f.n_experts))throw std::runtime_error("VRAM expert format changed");
         if(!engine){
             if(device<0)cuda_check(cudaGetDevice(&device));else cuda_check(cudaSetDevice(device));
             detect_unified();
@@ -1911,6 +1914,7 @@ struct tier {
         if(!active || !count)return;
         initialize_format(r,*f);
         for(int j=0;j<count;++j){
+            if(r[j].expert<0 || r[j].expert>=f->n_experts)throw std::runtime_error("VRAM tensor expert out of range");
             if(!std::isfinite(r[j].weight) || r[j].weight<0)throw std::runtime_error("VRAM routing weight");
             for(int i=0;i<3;++i)if(r[j].role[i].bytes!=role_bytes[i])throw std::runtime_error("VRAM role bytes changed");
         }
@@ -2199,10 +2203,10 @@ struct tier {
             initialize_format(r,*f,false);
         }
         if(!format_mode || latent!=f->latent || hidden!=f->hidden || weight_type!=f->weight_type ||
-                down_type!=f->down_type || n_experts!=f->n_experts)
+                down_type!=f->down_type || n_experts<f->n_experts)
             throw std::runtime_error("grouped-prefill expert format changed");
         for(int j=0;j<count;++j){
-            if(r[j].layer<0 || r[j].expert<0 || r[j].expert>=n_experts)
+            if(r[j].layer<0 || r[j].expert<0 || r[j].expert>=f->n_experts)
                 throw std::runtime_error("invalid grouped-prefill expert key");
             for(int role=0;role<3;++role)if(r[j].role[role].bytes!=role_bytes[role])
                 throw std::runtime_error("grouped-prefill role bytes changed");

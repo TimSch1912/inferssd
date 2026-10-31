@@ -23,6 +23,17 @@ int main(){
     tier t(32ULL<<20, inputs.tier_policy(), nullptr, test_cpu_kernels());int slot=-1;std::vector<float> input(256,0),output(256);char error[256]={};
     auto warm=[&]{t.begin(17,1,true);lifecycle_prepare(t,&request,1,&slot);t.admit(request,data,true);t.finish(output.data(),256);};
     warm();require(t.table && t.arena,"explicit cache was not allocated");
+    {
+        auto smaller=lifecycle_format();smaller.n_experts=128;
+        auto * engine=t.engine;auto * table=t.table.get();const auto capacity=t.capacity_bytes;
+        auto draft=request;draft.layer=40;draft.expert=127;
+        t.begin(17,2,true);t.prepare_format(&draft,1,&smaller,&slot);t.finish(output.data(),256);
+        require(t.engine==engine && t.table.get()==table && t.capacity_bytes==capacity && t.n_experts==256,
+            "smaller expert layer replaced the shared engine/cache");
+        draft.expert=128;t.begin(17,3,true);bool rejected=false;
+        try{t.prepare_format(&draft,1,&smaller,&slot);}catch(const std::runtime_error &){rejected=true;}
+        t.finish(output.data(),256);require(rejected,"smaller tensor expert bound was not enforced");
+    }
     require(api_prepare(&t,&request,1,256,256,&slot,error,sizeof(error))!=0 &&
         std::strstr(error,"implicit expert format retired") && !t.table && !t.arena && t.done && t.pending_uploads.empty(),
         "implicit prepare did not reject and drain its context");
