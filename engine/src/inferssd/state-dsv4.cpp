@@ -3,7 +3,6 @@
 #include "llama-io.h"
 #include "llama-impl.h"
 #include "ggml-backend.h"
-#include "state-dsv4-constants.h"
 
 #include <algorithm>
 #include <limits>
@@ -401,7 +400,7 @@ void llama_kv_cache_dsv4::state_write_until(llama_io_write_i & io, llama_seq_id 
         const uint32_t n_rows_csa = seq_id >= 0 ?
             dsv4_state_n_used_k_rows(pos_last, ratio_kv, kv_csa->get_size()) : kv_csa->get_size();
         const uint32_t n_rows_hca = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_last, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
+            dsv4_state_n_used_k_rows(pos_last, hca_state->get_ratio(), kv_hca->get_size()) : kv_hca->get_size();
         const uint32_t n_rows_lid = seq_id >= 0 ?
             dsv4_state_n_used_k_rows(pos_last, ratio_kv, kv_lid->get_size()) : kv_lid->get_size();
 

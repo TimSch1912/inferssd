@@ -1292,9 +1292,9 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             bool res = true;
 
             res = res & kv_raw->seq_rm(seq_id, p0, -1);
-            res = res & kv_csa->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
-            res = res & kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
-            res = res & kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+            res = res & kv_csa->seq_rm(seq_id, p0/ratio_kv, -1);
+            res = res & kv_hca->seq_rm(seq_id, p0/hca_state->get_ratio(), -1);
+            res = res & kv_lid->seq_rm(seq_id, p0/ratio_kv, -1);
 
             return res;
         }
