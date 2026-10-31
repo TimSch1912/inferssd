@@ -1,5 +1,7 @@
 # DeepSeek-V4.1-1017: DSpark-Sidecar und MTP-Entwurf
 
+Aktuelle Implementierung des ersten Laufzeitmodus: [dspark-runtime.md](dspark-runtime.md). Der folgende Text dokumentiert den vorherigen Entwurfsstand.
+
 Stand: 31.10.2026, Worktree `/home/timo/work/inferssd-opt-mtp`, Branch `opt-mtp`, Ausgangsstand `e45e752`. D/G wurden zuerst gelesen. Konvertierung und Dateiprüfungen erfolgten CPU-only; kein Serverstart, keine Modellinferenz, kein GPU-Test. Die folgenden Loader-/Graph-/Server-Änderungen sind **Entwurf**, noch keine implementierte Laufzeitfunktion.
 
 ## Ergebnis und notwendige Korrektur des ersten Meilensteins

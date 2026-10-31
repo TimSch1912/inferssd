@@ -1143,6 +1143,10 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params) :
     pimpl(new impl{}) {
+    if (!params.speculative.mtp_sidecar.empty() &&
+        (params.speculative.has_dft() || !params.lora_adapters.empty())) {
+        throw std::invalid_argument("DSpark sidecar cannot be combined with a separate draft model or LoRA");
+    }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1162,6 +1166,11 @@ common_init_result::common_init_result(common_params & params) :
     }
 
     pimpl->model.reset(model);
+    if (!params.speculative.mtp_sidecar.empty() &&
+        !llama_model_load_mtp_sidecar(model, params.speculative.mtp_sidecar.c_str())) {
+        pimpl->model.reset();
+        return;
+    }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 

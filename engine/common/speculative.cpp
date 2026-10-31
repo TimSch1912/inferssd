@@ -22,6 +22,7 @@
 const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
     COMMON_SPECULATIVE_TYPE_DRAFT,
+    COMMON_SPECULATIVE_TYPE_DSPARK,
     COMMON_SPECULATIVE_TYPE_EAGLE3,
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
@@ -33,6 +34,7 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
+    {"dspark",        COMMON_SPECULATIVE_TYPE_DSPARK},
     {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
     {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
@@ -161,6 +163,51 @@ struct common_speculative_state {
 
     virtual int32_t n_max(const common_params_speculative & params) const = 0;
     virtual int32_t n_min(const common_params_speculative & params) const = 0;
+};
+
+// Only committed target features are needed; no draft KV survives a proposal.
+struct common_speculative_state_dspark : common_speculative_state {
+    llama_context * ctx;
+    std::map<llama_pos, std::vector<float>> history;
+    explicit common_speculative_state_dspark(llama_context * ctx)
+        : common_speculative_state(COMMON_SPECULATIVE_TYPE_DSPARK), ctx(ctx) {}
+    void begin(const llama_tokens & prompt) override { if (prompt.empty()) { history.clear(); } }
+    bool process(const llama_batch & batch, llama_seq_id seq) override {
+        // Unmasked nextn rows include tokens whose logits were not requested (prefill and replay).
+        const size_t width = 3*llama_model_n_embd(llama_get_model(ctx));
+        llama_synchronize(ctx);
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != seq) { return false; }
+            const auto pos = batch.pos[i];
+            history.erase(history.lower_bound(pos), history.end());
+            const float * row = llama_get_embeddings_nextn_ith(ctx, i);
+            if (!row) { return false; }
+            history[pos] = std::vector<float>(row, row+width);
+        }
+        // Keep an extra window so verification/replay cannot evict a still-committed context row.
+        while (history.size() > 256) { history.erase(history.begin()); }
+        return true;
+    }
+    void draft(const common_params_speculative &, const llama_tokens & prompt, llama_token known,
+            llama_tokens & result) override {
+        if (prompt.size() < 2 || history.empty()) { return; }
+        const llama_pos last = prompt.size()-1;
+        const llama_pos first = std::max<llama_pos>(0,last-127);
+        std::vector<float> features; std::vector<llama_pos> positions;
+        // Match the reference window's physical ring order (slots 0..127).
+        for (llama_pos slot = 0; slot < std::min<llama_pos>(128,last+1); ++slot) {
+            const llama_pos p = last-((last-slot)%128);
+            if (p < first) { return; }
+            const auto it = history.find(p);
+            if (it == history.end()) { return; } // e.g. a disk prompt-cache hit: wait for a complete new window.
+            positions.push_back(p); features.insert(features.end(),it->second.begin(),it->second.end());
+        }
+        const auto token = llama_dspark_draft(ctx, features.data(), positions.data(), positions.size(), known);
+        if (token != LLAMA_TOKEN_NULL) { result.push_back(token); }
+    }
+    void accept(uint16_t) override {}
+    int32_t n_max(const common_params_speculative &) const override { return 1; }
+    int32_t n_min(const common_params_speculative &) const override { return 1; }
 };
 
 struct common_speculative_checkpoint {
@@ -969,6 +1016,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
     switch (type) {
         case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
         case COMMON_SPECULATIVE_TYPE_DRAFT:         return "draft";
+        case COMMON_SPECULATIVE_TYPE_DSPARK:        return "dspark";
         case COMMON_SPECULATIVE_TYPE_EAGLE3:        return "eagle3";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram_simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram_map_k";
@@ -992,6 +1040,12 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt) {
+    if (llama_model_has_mtp_sidecar(llama_get_model(ctx_tgt))) {
+        auto * spec = new common_speculative;
+        spec->impls.emplace_back(std::make_unique<common_speculative_state_dspark>(ctx_tgt));
+        return spec;
+    }
+    if (params.type == COMMON_SPECULATIVE_TYPE_DSPARK) { return nullptr; }
     llama_context * ctx_dft = nullptr;
     if (params.draft.model) {
         params.draft.cparams.ctx_other = ctx_tgt;
@@ -1060,6 +1114,7 @@ common_speculative * common_speculative_init(
     for (const common_speculative_config & config : configs) {
         LOG_DBG("%s: adding implementation %s\n", __func__, common_speculative_type_to_str(config.type).c_str());
         switch (config.type) {
+            case COMMON_SPECULATIVE_TYPE_DSPARK:
             case COMMON_SPECULATIVE_TYPE_NONE:
                 break;
             case COMMON_SPECULATIVE_TYPE_DRAFT: {

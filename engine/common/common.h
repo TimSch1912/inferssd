@@ -160,6 +160,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
     COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
+    COMMON_SPECULATIVE_TYPE_DSPARK,        // three-stage DSpark sidecar
     // 3 and 4 are reserved for retired draft modes.
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE = 5, // simple self-speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
@@ -351,6 +352,7 @@ struct common_params_speculative_ngram_cache {
 };
 
 struct common_params_speculative {
+    std::string mtp_sidecar;
     // TODO: become a vector in order to support "chains of speculators"
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
 

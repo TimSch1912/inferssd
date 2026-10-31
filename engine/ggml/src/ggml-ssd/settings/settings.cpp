@@ -330,6 +330,17 @@ const std::vector<descriptor> & registry() {
     return entries;
 }
 
+snapshot snapshot::with_source(const std::string & path) const {
+    snapshot result = *this;
+    if (!path.empty()) {
+        auto & source = result.values_.at("expert.source");
+        auto & paths = std::get<std::vector<std::string>>(source.data);
+        if (std::find(paths.begin(), paths.end(), path) == paths.end()) { paths.push_back(path); }
+        source.receipt += "; DSpark sidecar index";
+    }
+    return result;
+}
+
 const setting * snapshot::find(const std::string & key) const noexcept {
     const auto it = values_.find(key);
     return it == values_.end() ? nullptr : &it->second;

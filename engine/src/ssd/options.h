@@ -40,7 +40,7 @@ struct llama_ssd_context {
     std::unique_ptr<void, llama_ssd_source_delete> gpu_transport;
     ssd::stream::runtime stream;
 
-    explicit llama_ssd_context(const llama_ssd_options & options);
+    explicit llama_ssd_context(const llama_ssd_options & options, const std::string & extra_source = "");
     void bind_cpu(ggml_backend_t backend);
     void attach_backend(ggml_backend_t backend);
     void prepare_dense(const llama_model & model);

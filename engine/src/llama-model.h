@@ -652,6 +652,7 @@ struct llama_model {
         return -1;
     }
 
+    std::unique_ptr<struct llama_dspark_model> dspark;
     std::vector<llama_layer> layers;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma

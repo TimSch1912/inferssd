@@ -55,6 +55,11 @@ int main(int argc, char ** argv) {
     assert(*base.value.integer("prefetch.depth") == 2);
     assert(base.value.integer("expert.source") == nullptr);
     assert(base.value.find("unknown") == nullptr);
+    const auto extended = base.value.with_source("/models/mtp-experts.tsv");
+    assert(base.value.sources()->empty());
+    assert(*extended.sources() == std::vector<std::string>{"/models/mtp-experts.tsv"});
+    assert(extended.with_source("/models/mtp-experts.tsv").sources()->size() == 1);
+    assert(base.value.with_source("").json().value == base.value.json().value);
     const std::string text =
         "inferssd-settings 1\n"
         "prefetch.depth = 4 # source=derived; input=measured CPUs\n"

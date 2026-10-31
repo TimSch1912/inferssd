@@ -216,6 +216,8 @@ private:
 
     rope_cfg layer_rope_cfg(int il) const;
 
+    void build_dspark(const struct llama_dspark_input & input);
+
     // hyper-connection stream
     ggml_tensor * build_hc_pre(ggml_tensor * x, ggml_tensor * weights, int il) const;
     ggml_tensor * build_hc_sinkhorn(ggml_tensor * comb, int il) const;

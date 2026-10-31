@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "models.h"
+#include "llama-dspark.h"
+#include "llama-dspark-quant.h"
 #include "deepseek41-candidate.h"
 
 #include "llama-engram.h"
@@ -87,6 +89,21 @@ ggml_tensor * dsv41_hc_mean(ggml_context * ctx, ggml_tensor * x) {
         acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
     }
     return ggml_scale(ctx, acc, 1.0f/hc);
+}
+
+void dspark_quant_op(ggml_tensor * dst, int ith, int nth, void *) {
+    const auto * src = static_cast<const float *>(dst->src[0]->data);
+    auto * out = static_cast<float *>(dst->data);
+    GGML_ASSERT(ggml_is_contiguous(dst->src[0]) && ggml_is_contiguous(dst) && ggml_nelements(dst)%32 == 0);
+    for (int64_t i = ith; i < ggml_nelements(dst)/32; i += nth) { llama_dspark_act_quant32(src+32*i,out+32*i); }
+}
+
+ggml_tensor * dspark_quant(ggml_context * ctx, ggml_tensor * x, ggml_backend_sched_t sched, ggml_backend_t cpu) {
+    ggml_tensor * args[] = {ggml_cont(ctx,x)};
+    auto * out = ggml_custom_4d(ctx,GGML_TYPE_F32,x->ne[0],x->ne[1],x->ne[2],x->ne[3],
+        args,1,dspark_quant_op,GGML_N_TASKS_MAX,nullptr);
+    ggml_backend_sched_set_tensor_backend(sched,out,cpu);
+    return out;
 }
 
 struct dsv41_state_tensors {
@@ -682,7 +699,7 @@ ggml_tensor * llm_build_deepseek41::build_attention_tail(
         ggml_tensor * inp_pos,
         int64_t nt,
         int il) const {
-    const auto & layer = model.layers[il];
+    const auto & layer = il < 40 ? model.layers[il] : model.dspark->layers[il - 40];
 
     const int64_t n_embd_head      = hparams.n_embd_head_k();
     const int64_t n_embd_head_rope = hparams.n_rot();
@@ -698,6 +715,7 @@ ggml_tensor * llm_build_deepseek41::build_attention_tail(
             rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
     out = ggml_rope_set_offset(out, n_embd_head_nope);
     cb(out, "attn_derope", il);
+    if (il >= 40 && model.dspark) { out = dspark_quant(ctx0,out,sched,backend_cpu); }
 
     out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
     out = ggml_permute(ctx0, out, 0, 2, 1, 3);
@@ -1123,6 +1141,7 @@ ggml_tensor * llm_build_deepseek41::build_attention_v41(
 
 llm_build_deepseek41::llm_build_deepseek41(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params), model(model) {
+    if (params.dspark) { build_dspark(*params.dspark); return; }
     ggml_tensor * cur;
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
@@ -1144,7 +1163,12 @@ llm_build_deepseek41::llm_build_deepseek41(const llama_model & model, const llm_
             ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
     cb(pre_mix, "hc_pre_init", -1);
 
+    ggml_tensor * features = nullptr;
     for (int il = 0; il < n_layer; ++il) {
+        if (model.dspark && cparams.embeddings_nextn && il >= 37) {
+            auto * mean = dsv41_hc_mean(ctx0, inpL);
+            features = features ? ggml_concat(ctx0, features, mean, 0) : mean;
+        }
         // the engram sits before the block and writes straight into the stream
         if (model.engram_index(il) >= 0) {
             inpL = build_engram(inpL, build_inp_engram(il), il);
@@ -1237,6 +1261,14 @@ llm_build_deepseek41::llm_build_deepseek41(const llama_model & model, const llm_
         cb(inpL, "l_last", il);
     }
 
+    if (features) {
+        if (cparams.embeddings_nextn_masked && inp_out_ids) { features = ggml_get_rows(ctx0, features, inp_out_ids); }
+        res->t_h_nextn = features;
+        ggml_set_output(features);
+        cb(features, "dspark_features", -1);
+        ggml_build_forward_expand(gf, features);
+    }
+
     if (inp_out_ids) {
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);
@@ -1256,4 +1288,91 @@ llm_build_deepseek41::llm_build_deepseek41(const llama_model & model, const llm_
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+namespace {
+class dspark_graph_input : public llm_graph_input_i {
+public:
+    llama_dspark_input input;
+    ggml_tensor * features;
+    ggml_tensor * positions;
+    dspark_graph_input(const llama_dspark_input & input, ggml_tensor * features, ggml_tensor * positions)
+        : input(input), features(features), positions(positions) {}
+    void set_input(const llama_ubatch *) override {
+        ggml_backend_tensor_set(features, input.features, 0, ggml_nbytes(features));
+        ggml_backend_tensor_set(positions, input.positions, 0, ggml_nbytes(positions));
+    }
+    bool can_reuse(const llm_graph_params &) override { return false; }
+};
+}
+
+// Official model.py @ 1bae0e1088993b9b82de08f59de5be5a34e42170: DSparkAttention/Block.
+// ponytail: rebuild the 128-row context from committed features; persist projected KV when profiling warrants it.
+void llm_build_deepseek41::build_dspark(const llama_dspark_input & input) {
+    const auto & mtp = *model.dspark;
+    constexpr int64_t block = 5;
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const int64_t dim = hparams.n_embd_head_k();
+    const int64_t rd = hparams.n_rot();
+    auto * features = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 3*n_embd, input.n_context);
+    auto * context_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, input.n_context);
+    ggml_set_input(features); ggml_set_input(context_pos);
+    res->add_input(std::make_unique<dspark_graph_input>(input, features, context_pos));
+    auto * main_x = build_norm(ggml_mul_mat(ctx0, mtp.main_proj, features), mtp.main_norm, nullptr, LLM_NORM_RMS, -1);
+    auto * tokens = build_inp_embd(model.tok_embd);
+    auto * draft_pos = build_inp_pos();
+    auto * stream = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, tokens, n_embd, 1, block), n_embd, hc, block, 1);
+    auto * pre_mix = ggml_concat(ctx0,
+        ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, block), 1.0f),
+        ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc-1, block), 0.0f), 0);
+    for (int k = 0; k < 3; ++k) {
+        const int il = 40+k;
+        const auto & layer = mtp.layers[k];
+        ggml_tensor * attn_pre, * post, * comb;
+        auto * residual = stream;
+        build_hc_mixes(stream, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &attn_pre, &post, &comb, il);
+        auto * cur = build_norm(build_hc_pre(stream, pre_mix, il), layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+        auto rope = [&](ggml_tensor * x, ggml_tensor * positions) {
+            x = ggml_rope_ext(ctx0, x, positions, nullptr, rd, rope_type, 0,
+                freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            return ggml_rope_set_offset(x, dim-rd);
+        };
+        auto * qr = build_norm(build_lora_mm(layer.wq_a, cur), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+        auto * q = rope(ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), dim, n_head, block), draft_pos);
+        auto kv = [&](ggml_tensor * x, ggml_tensor * positions, int64_t n) {
+            x = build_norm(build_lora_mm(layer.wkv, x), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+            return dspark_quant(ctx0,rope(ggml_reshape_3d(ctx0, x, dim, 1, n), positions),sched,backend_cpu);
+        };
+        auto * context_kv = kv(main_x, context_pos, input.n_context);
+        auto * draft_kv = kv(cur, draft_pos, block);
+        // All context rows and all five temporary draft rows are visible to every draft query.
+        auto * keys = ggml_concat(ctx0, context_kv, draft_kv, 2);
+        cur = build_attn_mha(q, keys, keys, nullptr, nullptr, layer.attn_sinks, nullptr, 1.0f/std::sqrt(float(dim)), il);
+        cur = build_attention_tail(cur, draft_pos, block, il);
+        stream = build_hc_post(cur, residual, post, comb, il);
+        residual = stream;
+        build_hc_mixes(stream, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &pre_mix, &post, &comb, il);
+        cur = build_norm(build_hc_pre(stream, attn_pre, il), layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+        ggml_build_forward_expand(gf, residual);
+        ggml_build_forward_expand(gf, post);
+        ggml_build_forward_expand(gf, comb);
+        auto * experts = build_moe_ffn(cur, layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps,
+            layer.ffn_down_exps, layer.ffn_exp_probs_b, 128, 3, LLM_FFN_SILU, true, 1.5f,
+            (llama_expert_gating_func_type)hparams.expert_gating_func, il);
+        auto * shared = build_ffn(cur, layer.ffn_up_shexp, nullptr, nullptr,
+            layer.ffn_gate_shexp, nullptr, nullptr, layer.ffn_down_shexp, nullptr, nullptr,
+            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        stream = build_hc_post(ggml_add(ctx0, experts, shared), residual, post, comb, il);
+    }
+    auto * hidden = build_hc_pre(stream, pre_mix, -1);
+    // The other hidden positions participate in attention, but their output heads cannot affect proposal #1.
+    hidden = ggml_view_2d(ctx0, hidden, n_embd, 1, hidden->nb[1], 0);
+    auto * logits = ggml_mul_mat(ctx0, model.output, build_norm(hidden, mtp.norm, nullptr, LLM_NORM_RMS, -1));
+    auto * known = ggml_view_1d(ctx0, res->t_inp_tokens, 1, 0);
+    auto * markov = ggml_get_rows(ctx0, mtp.markov_embd, known);
+    logits = ggml_add(ctx0, logits, ggml_mul_mat(ctx0, mtp.markov_output, markov));
+    cb(logits, "dspark_logits", -1);
+    res->t_logits = logits;
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
 }

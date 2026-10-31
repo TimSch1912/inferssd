@@ -11,6 +11,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-dspark.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -42,7 +43,7 @@ llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
-    ssd_runtime(params.ssd_options ? std::make_unique<llama_ssd_context>(*params.ssd_options) : nullptr),
+    ssd_runtime(params.ssd_options ? std::make_unique<llama_ssd_context>(*params.ssd_options, model.dspark ? model.dspark->index_path : "") : nullptr),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -67,7 +68,7 @@ llama_context::llama_context(
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings       = params.embeddings;
-    cparams.embeddings_nextn = false;
+    cparams.embeddings_nextn = model.dspark != nullptr;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
@@ -193,6 +194,9 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty();
+    if (model.dspark && (!cpu_sink_enabled || cparams.n_seq_max != 1 || cparams.n_ubatch < 5)) {
+        throw std::runtime_error("DSpark requires SSD experts, --parallel 1 and --ubatch-size >= 5");
+    }
     dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {
         if (llama_ssd::describe_experts(model.arch, model.hparams, -1).activation ==
@@ -315,12 +319,13 @@ llama_context::llama_context(
                         routed_layers.push_back(int32_t(il));
                     }
                 }
-                cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
+                if (model.dspark) { for (int il = 40; il < 43; ++il) { routed_layers.push_back(il); } }
+                cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer + (model.dspark ? 3 : 0),
                     kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
                     int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
                 if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
-                    for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
-                        const auto & layer = model.layers[il];
+                    for (uint32_t il = 0; il < model.hparams.n_layer + (model.dspark ? 3 : 0); ++il) {
+                        const auto & layer = il < model.hparams.n_layer ? model.layers[il] : model.dspark->layers[il - 40];
                         for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
                             if (experts) {
                                 cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
@@ -1325,6 +1330,10 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+size_t llama_context::nextn_width() const {
+    return model.hparams.n_embd * (model.dspark ? 3u : 1u);
+}
+
 float * llama_context::get_embeddings_nextn() {
     output_reorder();
     return embd_nextn.data;
@@ -1339,10 +1348,10 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
         }
         const int64_t row = cparams.embeddings_nextn_masked ? output_resolve_row(i) :
             (i < 0 ? (int64_t) n_outputs + i : i);
-        if (row < 0 || (size_t) row * model.hparams.n_embd >= embd_nextn.size) {
+        if (row < 0 || (size_t) row * nextn_width() >= embd_nextn.size) {
             throw std::runtime_error("nextn embedding index out of range");
         }
-        return embd_nextn.data + row * model.hparams.n_embd;
+        return embd_nextn.data + row * nextn_width();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid nextn embeddings id %d, reason: %s\n", __func__, i, err.what());
         return nullptr;
@@ -1707,7 +1716,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    if (cpu_sink_decode_active && ubatch.n_tokens > 1 && !cpu_sink_multi_token_reported) {
+    if (!model.dspark && cpu_sink_decode_active && ubatch.n_tokens > 1 && !cpu_sink_multi_token_reported) {
         // the sink decodes one token at a time and the prefill route is for prefill: a larger decode ubatch (a draft
         // to verify) runs ggml's MUL_MAT_ID where the scheduler puts it
         LLAMA_LOG_WARN("[kimi_cpu_sink] n_tokens=%u in decode runs ggml's MUL_MAT_ID %s; the sink decodes one token\n",
@@ -1982,10 +1991,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
     if (embd_nextn.data && t_h_nextn) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
-        GGML_ASSERT((size_t) n_tokens * hparams.n_embd <= embd_nextn.size);
+        GGML_ASSERT((size_t) n_tokens * nextn_width() <= embd_nextn.size);
         ggml_backend_tensor_get_async(
             backend_h, t_h_nextn, embd_nextn.data, 0,
-            (size_t) n_tokens * hparams.n_embd * sizeof(float));
+            (size_t) n_tokens * nextn_width() * sizeof(float));
     }
 
     // TODO: hacky solution
@@ -2522,12 +2531,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const size_t n_rows = cparams.embeddings_nextn_masked ? n_outputs : ubatch.n_tokens;
             const size_t row_offset = cparams.embeddings_nextn_masked ? n_outputs_prev : n_tokens_prev;
             if (n_rows > 0) {
-                GGML_ASSERT((row_offset + n_rows) * hparams.n_embd <= embd_nextn.size);
+                GGML_ASSERT((row_offset + n_rows) * nextn_width() <= embd_nextn.size);
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
                 ggml_backend_tensor_get_async(
-                    backend_h, t_h_nextn, embd_nextn.data + row_offset * hparams.n_embd,
-                    0, n_rows * hparams.n_embd * sizeof(float));
+                    backend_h, t_h_nextn, embd_nextn.data + row_offset * nextn_width(),
+                    0, n_rows * nextn_width() * sizeof(float));
             }
         }
 
@@ -2639,7 +2648,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size = has_logits ? n_vocab*n_outputs_max : 0;
     embd.size   = has_embd ? n_embd_out*n_outputs_max : 0;
-    embd_nextn.size = cparams.embeddings_nextn ? (size_t) n_embd * n_batch : 0;
+    embd_nextn.size = cparams.embeddings_nextn ? nextn_width() * n_batch : 0;
 
     for (bool enabled : cparams.embeddings_layer_inp) {
         if (enabled) {
@@ -2819,8 +2828,8 @@ void llama_context::output_reorder() {
         }
 
         if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
-            for (uint64_t k = 0; k < n_embd; ++k) {
-                std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
+            for (uint64_t k = 0; k < nextn_width(); ++k) {
+                std::swap(embd_nextn.data[i0*nextn_width() + k], embd_nextn.data[i1*nextn_width() + k]);
             }
         }
 
@@ -3149,7 +3158,8 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cpu_sink_decode =*/ cpu_sink_enabled && cpu_sink_decode_active && !cparams.warmup,
-        /*.cpu_sink_prefill =*/ !cpu_sink_decode_active && !cparams.warmup && cpu_sink_prefill_route(ubatch.n_tokens),
+        /*.cpu_sink_prefill =*/ !cparams.warmup && ((!cpu_sink_decode_active && cpu_sink_prefill_route(ubatch.n_tokens)) ||
+            (model.dspark && ubatch.n_tokens > 1 && ubatch.n_tokens <= 5)),
         /*.cpu_sink_runtime =*/ cpu_sink_runtime.get(),
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3230,7 +3240,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && strcmp(name, "norm") == 0) {
-                const auto & dev_layer = model.dev_layer(il);
+                const auto & dev_layer = model.dev_layer(model.dspark ? std::min(il, 39) : il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
@@ -4801,4 +4811,53 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+llama_token llama_context::dspark_draft(const float * features, const llama_pos * positions, int32_t count, llama_token known) {
+    if (!model.dspark || !features || !positions || count < 1 || count > 128 ||
+        known < 0 || known >= model.vocab.n_tokens() || !cpu_sink_runtime || !loras->empty()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    std::vector<llama_pos> ordered(positions,positions+count);
+    std::sort(ordered.begin(),ordered.end());
+    for (int i = 0; i < count; ++i) {
+        if (ordered[i] < 0 || (i && ordered[i] != ordered[i-1]+1)) { return LLAMA_TOKEN_NULL; }
+    }
+    synchronize();
+    auto * res = gf_res_prev.get();
+    res->reset();
+    ggml_backend_sched_reset(sched.get());
+    llama_token tokens[5] = {known,128799,128799,128799,128799};
+    llama_pos pos[5]; int32_t ns[5] = {1,1,1,1,1};
+    llama_seq_id seq = 0; llama_seq_id * ids[5] = {&seq,&seq,&seq,&seq,&seq};
+    int32_t seq_idx[LLAMA_MAX_SEQ] = {}; int8_t output[5] = {1,0,0,0,0};
+    for (int i = 0; i < 5; ++i) { pos[i] = ordered.back()+1+i; }
+    llama_ubatch ub = {};
+    ub.n_tokens = ub.n_seq_tokens = 5; ub.n_seqs = ub.n_seqs_unq = ub.n_pos = ub.b_equal_seqs = 1;
+    ub.token = tokens; ub.pos = pos; ub.n_seq_id = ns; ub.seq_id = ids;
+    ub.seq_id_unq = &seq; ub.seq_idx = seq_idx; ub.output = output;
+    llama_dspark_input input{features, positions, count, known};
+    auto gp = graph_params(res, ub, nullptr, LLM_GRAPH_TYPE_DECODER);
+    gp.cpu_sink_prefill = true; gp.cpu_sink_decode = false; gp.n_outputs = 1; gp.samplers.clear(); gp.dspark = &input;
+    auto * graph = model.build_graph(gp);
+    // Every draft goes through the same admission and expert runtime as the main graph.
+    if (!reserve_compute_graph(graph, true) || !ggml_backend_sched_alloc_prepared(sched.get(), graph)) {
+        discard_failed_graph(); return LLAMA_TOKEN_NULL;
+    }
+    res->set_inputs(&ub);
+    cpu_sink_runtime->begin(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)), 0, false);
+    if (graph_compute(graph, true) != GGML_STATUS_SUCCESS) { discard_failed_graph(); return LLAMA_TOKEN_NULL; }
+    synchronize();
+    std::vector<float> values(model.vocab.n_tokens());
+    ggml_backend_tensor_get(res->t_logits, values.data(), 0, values.size()*sizeof(float));
+    if (!std::all_of(values.begin(), values.end(), [](float x) { return std::isfinite(x); })) {
+        throw std::runtime_error("DSpark produced non-finite logits");
+    }
+    return std::max_element(values.begin(), values.end()) - values.begin();
+}
+
+llama_token llama_dspark_draft(llama_context * ctx, const float * features, const llama_pos * positions,
+        int32_t count, llama_token known) {
+    try { return ctx->dspark_draft(features, positions, count, known); }
+    catch (const std::exception & e) { LLAMA_LOG_ERROR("DSpark draft failed: %s\n", e.what()); return LLAMA_TOKEN_NULL; }
 }

@@ -439,6 +439,13 @@ extern "C" {
 
     // Helpers for getting default parameters
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
+    // Opt-in DSpark sidecar; call before creating any contexts. Failure leaves the model unchanged.
+    LLAMA_API bool llama_model_load_mtp_sidecar(struct llama_model * model, const char * path);
+    LLAMA_API bool llama_model_has_mtp_sidecar(const struct llama_model * model);
+    // Draft one token from up to 128 committed features, each 3*n_embd floats, with their absolute positions.
+    LLAMA_API llama_token llama_dspark_draft(struct llama_context * ctx, const float * features,
+        const llama_pos * positions, int32_t n_context, llama_token known);
+
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
     LLAMA_API struct llama_context_params        llama_context_default_params(void);
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);

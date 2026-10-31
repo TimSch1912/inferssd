@@ -123,8 +123,8 @@ size_t llama_ssd_schema_json(char * output, size_t size) {
     return required;
 }
 
-llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
-    : settings(options.settings), debug(options.debug), stream(services) {
+llama_ssd_context::llama_ssd_context(const llama_ssd_options & options, const std::string & extra_source)
+    : settings(options.settings.with_source(extra_source)), debug(options.debug), stream(services) {
     if (!settings.sources()->empty()) {
         host_owner = ::host_owner();
         auto registered = host_owner->make_client();

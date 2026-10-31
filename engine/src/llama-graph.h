@@ -660,10 +660,12 @@ struct llm_graph_params {
 
     // Maximum context position covered by the current scheduler reserve.
     uint32_t n_ctx_reserve = 0;
+    const struct llama_dspark_input * dspark = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (dspark || other.dspark) { return false; }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -773,7 +775,7 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
-    ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs], hidden state before final norm
+    ggml_tensor * t_h_nextn     = nullptr; // [nextn_width, rows], DSpark: 3*n_embd HC input features
 
     std::vector<ggml_tensor *> t_layer_inp;
 

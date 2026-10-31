@@ -248,6 +248,7 @@ struct server_slot {
         n_sent_text    = 0;
 
         if (can_speculate()) {
+            if (llama_model_has_mtp_sidecar(llama_get_model(ctx))) { common_speculative_begin(spec.get(), {}); }
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
@@ -411,7 +412,8 @@ struct server_slot {
                 if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                     const auto n_tokens = prompt.tokens.size();
 
-                    spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens);
+                    spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens, -1, -1,
+                        llama_model_has_mtp_sidecar(llama_get_model(ctx)) ? 0 : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                     SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
                             spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
@@ -2245,6 +2247,57 @@ private:
         return true;
     }
 
+    // DSpark correctness milestone: audit the batched verifier, then restore before consuming target RNG.
+    // ponytail: sequential decisions preserve ordinary sampling; enable a batch fast path only after logit parity.
+    llama_tokens verify_dspark(server_slot & slot, std::vector<completion_token_output> & outputs) {
+        const auto & ckpt = slot.spec_ckpt;
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        std::vector<std::vector<float>> verifier;
+        for (const auto i : slot.spec_i_batch) {
+            const auto * row = llama_get_logits_ith(slot.ctx,i);
+            if (!row) { throw std::runtime_error("missing DSpark verifier logits"); }
+            verifier.emplace_back(row,row+n_vocab);
+        }
+        if (llama_state_seq_set_data_ext(slot.ctx,ckpt.data.data(),ckpt.size(),slot.id,0) != ckpt.size()) {
+            throw std::runtime_error("failed full DSpark state restore");
+        }
+        const llama_pos pos0 = ckpt.pos_max+1;
+        slot.prompt.tokens.keep_first(ckpt.n_tokens);
+        if (slot.prompt.tokens.pos_next() != pos0) { throw std::runtime_error("DSpark checkpoint position mismatch"); }
+        llama_tokens accepted;
+        llama_batch replay = llama_batch_init(1,0,1);
+        size_t equal = 0;
+        try {
+            llama_token input = slot.sampled;
+            for (size_t i = 0; i <= slot.spec_draft.size(); ++i) {
+                common_batch_clear(replay);
+                common_batch_add(replay,input,pos0+i,{slot.id},true);
+                if (llama_decode(slot.ctx,replay) != 0 || !common_speculative_process(slot.spec.get(),replay,slot.id)) {
+                    throw std::runtime_error("DSpark sequential verification failed");
+                }
+                metrics.on_decoded(slots);
+                const auto * row = llama_get_logits_ith(slot.ctx,0);
+                equal += std::memcmp(row,verifier[i].data(),n_vocab*sizeof(float)) == 0;
+                const auto token = common_sampler_sample(slot.smpl.get(),slot.ctx,0);
+                common_sampler_accept(slot.smpl.get(),token,true);
+                completion_token_output result;
+                result.tok = token;
+                result.prob = 1.0f;
+                if (slot.task->params.sampling.n_probs > 0) {
+                    populate_token_probs(slot,result,slot.task->params.post_sampling_probs,params_base.special,0);
+                }
+                outputs.push_back(std::move(result));
+                slot.prompt.tokens.push_back(input);
+                accepted.push_back(token);
+                if (llama_vocab_is_eog(vocab,token) || i == slot.spec_draft.size() || token != slot.spec_draft[i]) { break; }
+                input = token;
+            }
+        } catch (...) { llama_batch_free(replay); throw; }
+        llama_batch_free(replay);
+        SLT_INF(slot,"DSpark verifier logit audit: equal=%zu checked=%zu semantics=sequential-target\n",equal,accepted.size());
+        return accepted;
+    }
+
     void process_single_task(server_task && task) {
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
@@ -3471,6 +3524,8 @@ private:
 
                 GGML_ASSERT(n_draft > 0);
 
+                const bool dspark = llama_model_has_mtp_sidecar(llama_get_model(slot.ctx));
+                std::vector<completion_token_output> dspark_outputs;
                 bool spec_partial = false;
                 bool spec_recomputed = false;
                 size_t spec_argmax_checked = 0;
@@ -3498,7 +3553,13 @@ private:
                             logits, std::max_element(logits, logits + n_vocab)));
                     }
 
-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    const int64_t t_dspark_start = ggml_time_us();
+                    auto accepted = dspark ? verify_dspark(slot,dspark_outputs) :
+                        common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    if (dspark) {
+                        spec_recomputed = true;
+                        spec_recompute_ms = (ggml_time_us()-t_dspark_start)/1e3;
+                    }
                     slot.spec_i_batch.clear();
 
                     SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());
@@ -3519,7 +3580,7 @@ private:
                         LOG_DBG("%s: partial acceptance: %zu < %zu\n", __func__, accepted.size(), slot.spec_draft.size());
                     }
 
-                    if (use_ckpt) {
+                    if (use_ckpt && !dspark) {
                         const int64_t t_recompute_start = ggml_time_us();
                         if (!recompute_speculative_prefix(slot, accepted)) {
                             throw std::runtime_error(
@@ -3546,12 +3607,13 @@ private:
                         "sampled=%zu accepted_argmax_matched=%zu accepted_argmax_checked=%zu "
                         "sampled_argmax_matched=%zu sampled_argmax_checked=%zu partial=%d "
                         "recomputed=%d replay_rows=%zu draft_ms=%.3f recompute_ms=%.3f "
-                        "step_ms=%.3f semantics=batch-verifier\n",
+                        "step_ms=%.3f semantics=%s\n",
                         slot.n_spec_blocks, n_draft, ids.size() - 1, ids.size(),
                         spec_accepted_argmax_matched, spec_accepted_argmax_checked,
                         spec_argmax_matched, spec_argmax_checked, spec_partial,
                         spec_recomputed, spec_recomputed ? ids.size() : 0,
-                        slot.t_spec_draft_ms, spec_recompute_ms, spec_step_ms);
+                        slot.t_spec_draft_ms, spec_recompute_ms, spec_step_ms,
+                        llama_model_has_mtp_sidecar(llama_get_model(slot.ctx)) ? "sequential-target" : "batch-verifier");
                 slot.t_spec_step_start_us = 0;
                 slot.t_spec_draft_ms = 0.0;
 
@@ -3572,16 +3634,16 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
+                if (!llama_model_has_mtp_sidecar(llama_get_model(slot.ctx))) {
+                    llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
+                }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
-                    completion_token_output result;
+                    completion_token_output result = dspark ? std::move(dspark_outputs.at(i)) : completion_token_output{};
 
                     result.tok          = ids[i];
                     result.text_to_send = common_token_to_piece(slot.ctx, result.tok, accept_special_token(slot, result.tok));
-                    result.prob         = 1.0f; // set later
-
-                    // TODO: set result.probs
+                    if (!dspark) { result.prob = 1.0f; }
 
                     if (!process_token(result, slot)) {
                         slot.print_timings();

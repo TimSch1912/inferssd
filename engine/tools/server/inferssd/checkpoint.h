@@ -4,7 +4,7 @@
 #include "prompt-cache.h"
 #include "ggml.h"
 
-static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1) {
+static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1, llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
     if (pos_min == -1) {
         pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), id);
     }
@@ -12,7 +12,7 @@ static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int i
         pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), id);
     }
 
-    const size_t checkpoint_size = llama_state_seq_get_size_ext(ctx, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const size_t checkpoint_size = llama_state_seq_get_size_ext(ctx, id, flags);
 
     auto cur = server_prompt_checkpoint {
         /*.pos_min  = */ pos_min,
@@ -21,7 +21,7 @@ static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int i
         /*.data     = */ std::vector<uint8_t>(checkpoint_size),
     };
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, cur.data.data(), checkpoint_size, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const size_t n = llama_state_seq_get_data_ext(ctx, cur.data.data(), checkpoint_size, id, flags);
     if (n != checkpoint_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", checkpoint_size, n);
     }

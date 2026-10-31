@@ -59,6 +59,7 @@ struct override_value {
 // Copyable value object. All public accessors are const; contexts own a copy.
 class snapshot {
   public:
+    snapshot with_source(const std::string & path) const;
     const setting *                   find(const std::string & key) const noexcept;
     const uint64_t *                  integer(const std::string & key) const noexcept;
     const std::vector<std::string> *  sources() const noexcept;

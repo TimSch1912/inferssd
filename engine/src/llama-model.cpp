@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-dspark.h"
 #include "ssd/model-adapter.h"
 #include "ssd/model-pages.h"
 
