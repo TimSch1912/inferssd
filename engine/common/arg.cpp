@@ -3606,7 +3606,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
     add_opt(common_arg({"--mtp-sidecar"}, "PATH",
-        "enable DeepSeek-V4.1 DSpark with this sidecar (default: off)",
+        "enable DeepSeek-V4.1 DSpark (requires --ssd-vram-budget 0; default: off)",
         [](common_params & p, const std::string & path) {
             p.speculative.mtp_sidecar = path;
             p.speculative.type = COMMON_SPECULATIVE_TYPE_DSPARK;

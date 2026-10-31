@@ -194,8 +194,13 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty();
-    if (model.dspark && (!cpu_sink_enabled || cparams.n_seq_max != 1 || cparams.n_ubatch < 5)) {
-        throw std::runtime_error("DSpark requires SSD experts, --parallel 1 and --ubatch-size >= 5");
+    if (model.dspark && (!cpu_sink_enabled || params.ssd_options->settings.sources()->empty() ||
+            cparams.n_seq_max != 1 || cparams.n_ubatch < 5)) {
+        throw std::runtime_error("DSpark requires main SSD expert sources, --parallel 1 and --ubatch-size >= 5");
+    }
+    // ponytail: fixed CPU expert arithmetic until the mixed GPU chain has same-seed parity.
+    if (model.dspark && ssd_runtime->settings.vram_budget()->tier_bytes(true) != 0) {
+        throw std::runtime_error("DSpark correctness mode requires --ssd-vram-budget 0; mixed CPU/GPU experts change seeded samples");
     }
     dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {

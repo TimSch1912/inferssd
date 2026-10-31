@@ -48,9 +48,9 @@
 //
 // Differences from the upstream port:
 //  - no per-model classes in this tree, so the engram constants live on llama_model;
-//  - hyper-connection mixing always uses plain ggml ops (the fused DSV4 HC kernels are not ported);
+//  - hyper-connection mixing uses the engine's plain/fused ggml operations;
 //  - wo_a is loaded 2D and reshaped in the graph;
-//  - no per-layer input embedding extraction and no MTP graph.
+//  - DSpark sidecar weights stay separate from the 40-layer main graph and KV.
 
 namespace {
 
