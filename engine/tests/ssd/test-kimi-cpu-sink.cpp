@@ -3135,6 +3135,64 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
     }
     const auto uncached = activation_case(inputs, "mxfp4_swiglu_clamp_uncached", f, sink.get(), 1, input, top6, w6, clamp);
 
+    // Decode union: 2..5 columns, duplicate routes and skipped IDs. Cold reads
+    // count distinct experts; the next step must hit every resident exactly once.
+    {
+        auto cached = make_sink(inputs, f, threads, depth);
+        configure_cache(cached.get(), 40 * triplet_bytes(f), {1, 2}, 20);
+        char error[512] = {};
+        std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> grouped(
+            kimi_cpu_prefill_create(cached.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        require(bool(grouped), error);
+        tensors meta(f, 1);
+        for (int count=2; count<=5; ++count) {
+            std::vector<float> in(size_t(count)*f.latent), out(in.size()), expected(in.size()), weights(size_t(count)*6);
+            std::vector<int32_t> ids(size_t(count)*6);
+            std::vector<int32_t> distinct;
+            for (int t=0; t<count; ++t) {
+                for (int j=0; j<f.latent; ++j) { in[size_t(t)*f.latent+j]=input[j]+0.025f*t; }
+                for (int k=0; k<6; ++k) {
+                    ids[t*6+k]=k==5 ? -1 : (t*4+(k==4?0:k))%20;
+                    weights[t*6+k]=w6[k];
+                    if (ids[t*6+k]>=0 && std::find(distinct.begin(),distinct.end(),ids[t*6+k])==distinct.end()) {
+                        distinct.push_back(ids[t*6+k]);
+                    }
+                }
+                require(kimi_cpu_sink_run_activation(sink.get(),meta.role[0],meta.role[1],meta.role[2],
+                    in.data()+size_t(t)*f.latent,ids.data()+t*6,weights.data()+t*6,6,&clamp,
+                    expected.data()+size_t(t)*f.latent,nullptr,error,sizeof(error)),error);
+            }
+            kimi_cpu_sink_cache_reset(cached.get());
+            for (int repeat=0; repeat<2; ++repeat) {
+                begin_cache(cached.get(), 91, repeat+1);
+                kimi_cpu_prefill_stats detail={};
+                require(kimi_cpu_decode_run_activation(grouped.get(),meta.role[0],meta.role[1],meta.role[2],
+                    in.data(),ids.data(),weights.data(),6,count,&clamp,out.data(),&detail,error,sizeof(error)),error);
+                require(!std::memcmp(out.data(),expected.data(),out.size()*sizeof(float)),"decode union changed CPU output bits");
+                require(detail.stream.experts==distinct.size(),"decode did not plan the distinct union");
+                require(detail.stream.read_requests==(repeat?0:3*distinct.size()),"decode read an expert more than once");
+                require(detail.stream.cache_hits==(repeat?distinct.size():0),"decode lost RAM cache hits");
+                printf("case=mxfp4_decode_union tokens=%d repeat=%d experts=%zu reads=%llu bit_exact=1 status=PASS\n",
+                    count,repeat,distinct.size(),(unsigned long long)detail.stream.read_requests);
+            }
+        }
+    }
+
+    {
+        char error[512] = {};
+        std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> grouped(
+            kimi_cpu_prefill_create(sink.get(),error,sizeof(error)),kimi_cpu_prefill_destroy);
+        require(bool(grouped),error);
+        tensors meta(f,1);
+        std::vector<float> in(2*f.latent,0.25f), out(in.size(),1.0f), weights(12,0.5f);
+        std::vector<int32_t> ids(12,-1);
+        kimi_cpu_prefill_stats detail={};
+        require(kimi_cpu_decode_run_activation(grouped.get(),meta.role[0],meta.role[1],meta.role[2],
+            in.data(),ids.data(),weights.data(),6,2,&clamp,out.data(),&detail,error,sizeof(error)),error);
+        require(!detail.stream.experts && !detail.stream.read_requests &&
+            std::all_of(out.begin(),out.end(),[](float x){return x==0.0f;}),"empty decode union read weights or changed zero output");
+    }
+
     // RAM cache (count_decay2 as in the V4.1 recipe, and window): cold direct
     // admission, full and partial hits stay bit-identical to the graph.
     const uint64_t unit = triplet_bytes(f);

@@ -147,6 +147,10 @@ struct tier {
     std::vector<uint8_t> input;
     std::vector<float> down;
     std::vector<size_t> output_rows;
+    bool decode_batch = false;
+    std::vector<std::vector<int>> decode_tokens;
+    std::vector<int> decode_result;
+
     std::vector<size_t> pending_uploads;
     // Read-only grouped-prefill job. The full distinct-expert union is pinned
     // once; the worker reuses the existing <=16-route format engine per token.
@@ -1131,6 +1135,7 @@ struct tier {
             try{
                 cuda_check(cudaSetDevice(device));
                 if(grouped){run_prefill_worker();}
+                else if(compute && decode_batch){run_decode_batch();}
                 else if(compute){char error[512]={};int rc=
                     format_api->compute(engine,work.data(),int(work.size()),input.data(),input.size(),&activation,down.data(),error,sizeof(error));
                     if(rc)throw std::runtime_error(error);}
@@ -1908,17 +1913,21 @@ struct tier {
         else if(elastic_active && active)phase_decode_tokens=1;
         report("allocated");
     }
-    void prepare_format(const kimi_vram_request * r,int count,const kimi_vram_expert_format * f,int * slots){
-        if(count<0 || count>16 || (count && (!r || !slots)) || !f)throw std::runtime_error("VRAM request count");
+    void prepare_format(const kimi_vram_request * r,int count,const kimi_vram_expert_format * f,int * slots,bool batch=false){
+        if(count<0 || count>(batch?80:16) || (count && (!r || !slots)) || !f)throw std::runtime_error("VRAM request count");
         if(count)std::fill(slots,slots+count,-1);
         if(!active || !count)return;
         initialize_format(r,*f);
+        decode_batch = batch;
+        if (batch && (!mxfp4_batch || f->weight_type != int(GGML_TYPE_MXFP4) || f->down_type != int(GGML_TYPE_MXFP4))) {
+            throw std::runtime_error("multi-token decode requires the MXFP4 batch engine");
+        }
         for(int j=0;j<count;++j){
             if(r[j].expert<0 || r[j].expert>=f->n_experts)throw std::runtime_error("VRAM tensor expert out of range");
             if(!std::isfinite(r[j].weight) || r[j].weight<0)throw std::runtime_error("VRAM routing weight");
             for(int i=0;i<3;++i)if(r[j].role[i].bytes!=role_bytes[i])throw std::runtime_error("VRAM role bytes changed");
         }
-        table->prepare(r,count);std::copy(table->hits.begin(),table->hits.end(),slots);
+        table->prepare(r,count,UINT32_MAX,batch);std::copy(table->hits.begin(),table->hits.end(),slots);
         for(int slot:table->hits){gpu_hits+=slot>=0;cpu_requests+=slot<0;}
     }
     void launch_activation(const void * q,size_t bytes,const kimi_vram_activation * a){
@@ -1948,6 +1957,73 @@ struct tier {
         down.resize(work.size()*size_t(latent));done=false;queued=true;
         if(timing){launch_time=clock_type::now();++launches;}
         cv.notify_all();
+    }
+    void launch_decode_batch(const void * q,size_t stride,const int32_t * routes,int nslots,int ntokens,
+            const kimi_vram_activation * a) {
+        if (!active || !table || !table->in_flight) { return; }
+        if (!decode_batch || !q || !a || a->kind != KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP ||
+                !std::isfinite(a->swiglu_limit) || a->swiglu_limit <= 0 || !routes ||
+                ntokens < 2 || ntokens > 5 || nslots < 0 || nslots > 16 ||
+                stride != ggml_row_size(GGML_TYPE_Q8_0, latent)) { throw std::runtime_error("invalid multi-token VRAM launch"); }
+        for (int i=0; i<nslots*ntokens; ++i) {
+            if (routes[i]<-1 || (routes[i]>=0 && size_t(routes[i])>=table->requests.size())) {
+                throw std::runtime_error("invalid multi-token VRAM route index");
+            }
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!done) { throw std::runtime_error("GPU job already outstanding"); }
+        work.clear(); decode_tokens.clear(); output_rows.clear(); failure.clear();
+        decode_result.assign(size_t(nslots)*ntokens, -1);
+        input.assign(static_cast<const uint8_t *>(q), static_cast<const uint8_t *>(q)+stride*ntokens);
+        activation = *a;
+        int result = 0;
+        for (size_t j=0; j<table->hits.size(); ++j) {
+            const int slot=table->hits[j];
+            if (slot<0) { continue; }
+            std::vector<int> tokens;
+            for (int t=0; t<ntokens; ++t) {
+                bool found=false;
+                for (int k=0; k<nslots; ++k) {
+                    const int route=t*nslots+k;
+                    if (routes[route]==int(j)) { decode_result[size_t(route)] = result; found=true; }
+                }
+                if (found) { tokens.push_back(t); ++result; }
+            }
+            if (tokens.empty()) { throw std::runtime_error("VRAM expert without routes"); }
+            char * base=slot_base(size_t(slot));
+            work.push_back({base,base+role_bytes[0],base+role_bytes[0]+role_bytes[1]});
+            decode_tokens.push_back(std::move(tokens));
+        }
+        down.resize(size_t(result)*latent);
+        if (work.empty()) { return; }
+        done=false; queued=true;
+        if (timing) { launch_time=clock_type::now(); ++launches; }
+        cv.notify_all();
+    }
+    void run_decode_batch() {
+        std::vector<kimi_mxfp4_decode_expert> jobs;
+        int first=0, ntokens=0;
+        for (size_t i=0; i<work.size(); ++i) {
+            kimi_mxfp4_decode_expert job={work[i].up,work[i].gate,work[i].down,first,int(decode_tokens[i].size()),{}};
+            for (int j=0; j<job.count; ++j) { job.tokens[j]=decode_tokens[i][j];ntokens=std::max(ntokens,job.tokens[j]+1); }
+            first+=job.count; jobs.push_back(job);
+        }
+        char error[512]={};
+        if (!kimi_mxfp4_batch_decode_many(mxfp4_batch,jobs.data(),int(jobs.size()),input.data(),ntokens,first,
+                activation.swiglu_limit,down.data(),error,sizeof(error))) { throw std::runtime_error(error); }
+    }
+    void finish_decode_batch(float * output,size_t row_stride) {
+        if (!active || !table || !table->in_flight) { return; }
+        drain();
+        if (!failure.empty()) { throw std::runtime_error(failure); }
+        if (!output || row_stride<size_t(latent)) { throw std::runtime_error("VRAM batch output geometry"); }
+        for (size_t route=0; route<decode_result.size(); ++route) {
+            const int index=decode_result[route];
+            if (index>=0) { std::memcpy(output+route*row_stride,down.data()+size_t(index)*latent,size_t(latent)*sizeof(float)); }
+        }
+        for (size_t j:pending_uploads) { table->publish(j); }
+        pending_uploads.clear();
+        table->finish(); work.clear(); decode_tokens.clear(); decode_result.clear(); decode_batch=false;
     }
     void admit(const kimi_vram_request & r,const void * const * data,bool borrow){
         if(!active || !table || !table->in_flight)return;
@@ -2518,6 +2594,13 @@ int format_prepare(void * p,const kimi_vram_request * r,int count,const kimi_vra
     auto * t=static_cast<tier *>(p);try{t->prepare_format(r,count,f,slots);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int format_launch(void * p,const void * q,size_t bytes,const kimi_vram_activation * a,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->launch_activation(q,bytes,a);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int format_prepare_batch(void * p,const kimi_vram_request * r,int count,const kimi_vram_expert_format * f,int * slots,char * e,size_t n){
+    auto * t=static_cast<tier *>(p);try{t->prepare_format(r,count,f,slots,true);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int format_launch_batch(void * p,const void * q,size_t stride,const int32_t * routes,int nslots,int ntokens,
+        const kimi_vram_activation * a,char * e,size_t n){
+    auto * t=static_cast<tier *>(p);try{t->launch_decode_batch(q,stride,routes,nslots,ntokens,a);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int format_finish_batch(void * p,float * output,size_t stride,char * e,size_t n){
+    auto * t=static_cast<tier *>(p);try{t->finish_decode_batch(output,stride);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int prefill_prepare(void * p,const kimi_vram_request * r,int count,const kimi_vram_expert_format * f,int * slots,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->prepare_prefill(r,count,f,slots);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int prefill_transient_available(void * p){return p?static_cast<tier *>(p)->transient_prefill_available():0;}
@@ -2716,7 +2799,7 @@ extern "C" const kimi_vram_elastic_api * kimi_vram_elastic_get_api(){
     static const kimi_vram_elastic_api api={3,sizeof(kimi_vram_elastic_api),elastic_phase_complete,elastic_reserve_accumulate,elastic_reserve};return &api;
 }
 extern "C" const kimi_vram_format_api * kimi_vram_format_get_api(){
-    static const kimi_vram_format_api api={1,sizeof(kimi_vram_format_api),format_prepare,format_launch};return &api;
+    static const kimi_vram_format_api api={2,sizeof(kimi_vram_format_api),format_prepare,format_launch,format_prepare_batch,format_launch_batch,format_finish_batch};return &api;
 }
 extern "C" const kimi_vram_prefill_api * kimi_vram_prefill_get_api(){
     static const kimi_vram_prefill_api api={7,sizeof(kimi_vram_prefill_api),prefill_prepare,

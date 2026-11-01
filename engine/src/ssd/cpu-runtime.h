@@ -409,24 +409,25 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
     }
     const bool situ = node.activation.kind == KIMI_CPU_SINK_ACTIVATION_SITU;
     GGML_ASSERT(situ || !node.cache_compute);
-    if (node.small_decode) {
-        // ponytail: reuse the tier-aware vector executor for <=5 rows; no prefill transition or SSD-only drafts.
-        // Attention and dense operations still run as a single multi-token graph.
+    if (node.small_decode && ntokens > 1) {
         if (const ggml_tensor * hint=dst->src[5]; hint && runtime.prefetch_hint) {
-            runtime.prefetch_hint(runtime.sink,node.layer+1,static_cast<const int32_t *>(hint->data),int(ggml_nelements(hint)));
+            const auto * experts=static_cast<const int32_t *>(hint->data);
+            const int ranks=int(ggml_nelements(hint))/ntokens;
+            std::vector<int32_t> union_hint;
+            for (int rank=0; rank<ranks; ++rank) {
+                for (int t=0; t<ntokens; ++t) {
+                    const int32_t expert=experts[t*ranks+rank];
+                    if (std::find(union_hint.begin(),union_hint.end(),expert)==union_hint.end()) { union_hint.push_back(expert); }
+                }
+            }
+            runtime.prefetch_hint(runtime.sink,node.layer+1,union_hint.data(),int(union_hint.size()));
         }
-        ok = true;
-        for (int i = 0; i < ntokens && ok; ++i) {
-            kimi_cpu_sink_stats row = {};
-            ok = runtime.run_activation(runtime.sink, &node.up, &node.gate, &node.down,
-                static_cast<const float *>(input->data)+i*node.up.ne[0],
-                static_cast<const int32_t *>(ids->data)+i*nslots,
-                static_cast<const float *>(weights->data)+i*nslots, nslots, &activation,
-                static_cast<float *>(dst->data)+i*node.down.ne[1], &row, error, sizeof(error));
-            stats.read_requests += row.read_requests; stats.read_bytes += row.read_bytes;
-            stats.read_errors += row.read_errors; stats.fallback_count += row.fallback_count;
-            stats.total_us += row.total_us;
-        }
+        runtime.prefill.initialize(node.cpu_reg, runtime.sink);
+        ok = runtime.prefill.decode_run_activation(runtime.prefill.context, &node.up, &node.gate, &node.down,
+            static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
+            static_cast<const float *>(weights->data), nslots, ntokens,
+            &activation, static_cast<float *>(dst->data), &grouped_stats, error, sizeof(error));
+        stats = grouped_stats.stream;
     } else if (node.prefill) {
         runtime.prefill.initialize(node.cpu_reg, runtime.sink);
         ok = runtime.prefill.run_activation(runtime.prefill.context, &node.up, &node.gate, &node.down,

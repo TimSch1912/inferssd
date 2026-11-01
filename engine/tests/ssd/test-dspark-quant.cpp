@@ -5,6 +5,12 @@
 
 static void require(bool ok) { if (!ok) { throw std::runtime_error("DSpark FP8 quantization mismatch"); } }
 int main() {
+    const float scores[] = {0.1f,0.9f,0.6f,0.8f};
+    require(llama_dspark_confident_prefix(scores,4,0.5f)==4);
+    require(llama_dspark_confident_prefix(scores,4,0.7f)==2);
+    require(llama_dspark_confident_prefix(scores,4,0.95f)==1);
+    require(llama_dspark_confident_prefix(scores,1,1.0f)==1);
+
     try {
         float input[32] = {}, output[32];
         input[31] = 448.0f; // scale exactly 1, irrespective of the other values

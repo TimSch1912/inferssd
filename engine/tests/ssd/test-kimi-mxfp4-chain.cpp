@@ -13,6 +13,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-kimi-mxfp4-chain.h"
+#include "kimi-mxfp4-batch.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -250,8 +251,62 @@ void print_timing(const char * path, int iterations, const kimi_mxfp4_gpu_timing
 }
 }
 
+static void decode_batch_check() {
+    component g;
+    std::mt19937 rng(20261101);
+    const auto * api=kimi_mxfp4_batch_get_api();
+    char error[256]={};
+    auto * batch=api->create(0,latent,hidden,16,error,sizeof(error));
+    need(batch!=nullptr,error);
+    auto * chain=g.chain_api->create(g.handle,latent,hidden,1,KIMI_MXFP4_CHAIN_ROWS_Q8,0);
+    need(chain!=nullptr,g.api->error(g.handle));
+    for (int family=0; family<2; ++family) {
+        const kimi_mxfp4_chain_expert expert={g.upload(mxfp4_matrix(rng,latent,hidden,family)),
+            g.upload(mxfp4_matrix(rng,latent,hidden,family)),g.upload(mxfp4_matrix(rng,hidden,latent,family))};
+        for (int count=1; count<=5; ++count) {
+            for (float limit : {0.75f,10.0f}) {
+                std::vector<uint8_t> input;
+                std::vector<float> reference(size_t(count)*latent), actual(reference.size());
+                for (int t=0; t<count; ++t) {
+                    const auto x=make_input(rng,t%4);
+                    const auto q=q8_0(x.data(),latent);
+                    input.insert(input.end(),q.begin(),q.end());
+                    need(g.chain_api->submit(chain,&expert,1,q.data(),q.size(),limit),g.api->error(g.handle));
+                    need(g.api->wait(g.handle),g.api->error(g.handle));
+                    std::memcpy(reference.data()+size_t(t)*latent,g.result(0,latent),latent*sizeof(float));
+                }
+                need(kimi_mxfp4_batch_decode(batch,expert.up,expert.gate,expert.down,input.data(),count,limit,
+                    actual.data(),error,sizeof(error)),error);
+                need(!std::memcmp(reference.data(),actual.data(),actual.size()*sizeof(float)),"decode GPU batch differs from old vector rows");
+                // Three simultaneous experts, compact offsets, reordered and repeated input rows.
+                const kimi_mxfp4_decode_expert jobs[]={
+                    {expert.up,expert.gate,expert.down,0,count,{0,1,2,3,4}},
+                    {expert.up,expert.gate,expert.down,count,1,{count-1}},
+                    {expert.up,expert.gate,expert.down,count+1,1,{0}}};
+                actual.resize(size_t(count+2)*latent);
+                need(kimi_mxfp4_batch_decode_many(batch,jobs,3,input.data(),count,count+2,limit,
+                    actual.data(),error,sizeof(error)),error);
+                need(!std::memcmp(reference.data(),actual.data(),reference.size()*sizeof(float)),"fused GPU batch changed first expert");
+                need(!std::memcmp(reference.data()+size_t(count-1)*latent,actual.data()+size_t(count)*latent,latent*sizeof(float)),"fused GPU batch routed wrong token");
+                need(!std::memcmp(reference.data(),actual.data()+size_t(count+1)*latent,latent*sizeof(float)),"fused GPU batch routed wrong first token");
+                printf("GPU_DECODE_BATCH family=%d tokens=%d limit=%.2f rows=%zu bit_exact=1 PASS\n",family,count,limit,actual.size());
+            }
+        }
+    }
+    const uint8_t bad_input=0; float bad_output=0;
+    kimi_mxfp4_decode_expert invalid={g.held[0],g.held[1],g.held[2],0,6,{0,1,2,3,4}};
+    need(!kimi_mxfp4_batch_decode_many(batch,&invalid,1,&bad_input,5,6,1.0f,&bad_output,error,sizeof(error)),"accepted six decode columns");
+    invalid.count=1;invalid.tokens[0]=5;
+    need(!kimi_mxfp4_batch_decode_many(batch,&invalid,1,&bad_input,5,1,1.0f,&bad_output,error,sizeof(error)),"accepted out-of-range decode input");
+    invalid.tokens[0]=0;invalid.first=1;
+    need(!kimi_mxfp4_batch_decode_many(batch,&invalid,1,&bad_input,1,1,1.0f,&bad_output,error,sizeof(error)),"accepted a noncompact decode offset");
+    need(g.chain_api->destroy(chain),g.api->error(g.handle));
+    need(api->destroy(batch),"destroy decode batch");
+}
+
 int main(int argc, char ** argv) {
     try {
+        if (argc==2 && !std::strcmp(argv[1],"--decode-only")) { ggml_cpu_init();decode_batch_check();return 0; }
         need(argc <= 2, "usage: test-kimi-mxfp4-chain [timing_iterations]");
         const int iterations = argc == 2 ? std::max(1, std::atoi(argv[1])) : 20;
         ggml_cpu_init();

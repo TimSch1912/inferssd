@@ -6,6 +6,7 @@ Repeat with --mtp-sidecar, then: python3 tests/dspark_equivalence.py --compare o
 """
 import argparse
 import json
+import math
 import time
 import urllib.request
 from pathlib import Path
@@ -29,7 +30,8 @@ def record(base):
             "add_generation_prompt": True})
         tokens = rendered["tokens"]
         body = dict(prompt=tokens, n_predict=count, temperature=temperature, seed=seed, top_k=0,
-            top_p=0.95, min_p=0, repeat_penalty=1.05, cache_prompt=False, return_tokens=True)
+            top_p=0.95, min_p=0, repeat_penalty=1.05, cache_prompt=False, return_tokens=True,
+            n_probs=5, post_sampling_probs=False)
         if name == "grammar":
             body["grammar"] = 'root ::= "{" ws "\\\"color\\\"" ws ":" ws "\\\"blue\\\"" ws "," ws "\\\"count\\\"" ws ":" ws [0-9] "}"\nws ::= [ \\t\\n]*'
         start = time.monotonic()
@@ -37,7 +39,15 @@ def record(base):
         ids = reply.get("tokens")
         if not ids or not all(type(t) is int for t in ids):
             raise ValueError(f"{name}: no authoritative output token IDs")
-        row = dict(name=name, request=body, tokens=ids, content=reply["content"],
+        probabilities = reply["completion_probabilities"]
+        assert len(probabilities) == len(ids)
+        for p in probabilities:
+            assert math.isfinite(p["logprob"]) and p["logprob"] <= 0
+            assert all(math.isfinite(v["logprob"]) and v["logprob"] <= 0 for v in p["top_logprobs"])
+            values = [math.exp(v["logprob"]) for v in p["top_logprobs"]]
+            assert values and all(math.isfinite(v) and 0 <= v <= 1 for v in values)
+            assert values == sorted(values, reverse=True) and sum(values) <= 1.00001
+        row = dict(name=name, request=body, tokens=ids, content=reply["content"], probabilities=probabilities,
             timings=reply["timings"], wall_s=time.monotonic()-start)
         results.append(row)
         print(name, len(ids), reply["timings"], flush=True)

@@ -29,7 +29,11 @@ Explizite FP8/E8M0-Quant-/Dequant-Stellen bleiben erhalten.
 Die ersten k Outputpositionen verwenden den gemeinsamen Haupt-Head und einen
 verketteten Markov-Bias: Der Argmax einer Position bestimmt das Markov-Embedding
 der nächsten. Ein Graph liefert alle Vorschläge; Drafting verbraucht keinen
-Ziel-RNG. Die optionale Confidence-Projektion wird weiterhin nicht ausgewertet.
+Ziel-RNG. `--mtp-confidence P` wertet optional den originalen Confidence-Head aus:
+F32-Projektion von `[hidden, Markov-Embedding]`, danach Sigmoid. Ab dem zweiten
+Vorschlag wird am ersten Score unter P abgeschnitten; mindestens ein Draft bleibt.
+P=0 (Standard) deaktiviert das Gate. Der Score ist eine unkalibrierte Heuristik,
+keine nachgewiesene Akzeptanzwahrscheinlichkeit. Strict ignoriert das Gate.
 
 Fast verifiziert `[bekanntes Token, Draft 1, ..., Draft k]` in einer tatsächlichen
 Mehrtoken-UBatch. Pro Verifierzeile läuft der normale Ziel-Sampler einschließlich
@@ -63,7 +67,9 @@ UBatch oder eine nicht unterstützte Sequenzgeometrie wird abgelehnt.
 
 Bei vollständiger Akzeptanz werden nur die Undo-Daten freigegeben. Bei Reject
 werden die gesicherten Zeilen restauriert und das bereits gewählte Eingabepräfix
-tokenweise erneut berechnet, ohne Sampling oder RNG-Verbrauch.
+in einer einzigen Batch erneut berechnet, ohne Sampling oder RNG-Verbrauch.
+Das benutzt denselben Mehrspalten-Decode wie der Verifier; bei nur einer
+behaltenen Eingabe bleibt es der normale Einzeltoken-Pfad.
 Ein generisches DSv4-Suffix-Trim erfolgt danach nicht. Die Featurehistorie wird
 ab der Replayposition ersetzt; ein zusätzliches Fenster erhält ältere committed
 Features. Ein Promptcache-Treffer ohne vollständige Features fällt vorübergehend
@@ -81,12 +87,24 @@ Scheduler neu erzeugen und den Expert-Cache leeren. Innerhalb einer Decode-Phase
 bleibt außerdem der größte CUDA-Scratch-Pool reserviert: Ein kleinerer Draftgraph
 darf den Arbeitsspeicher des nächsten Verifiers nicht dem Expert-Tier überlassen.
 
-Kleine Decode-Batches verwenden den vorhandenen tierfähigen Vektorexecutor pro
-Expert-Zeile innerhalb eines gemeinsamen Dense-/Attention-Graphen. Sie eröffnen
-keine große Prefill-Phase. Ein fortlaufender Expert-Mikroschrittzähler vermeidet
-Cacheleerungen durch wiederholte oder übersprungene Modellpositionen. Der
-`count_decay2`-Cache kann eine Layergruppe mehrfach innerhalb desselben Schritts
-bedienen. First-Row-Prefetch verwendet die vorhandene Tiefeneinstellung.
+Decode-Batches mit 2..5 Eingaben planen pro Layer die Expert-Union einmal. Der
+CPU-Sink liest/admittiert jedes Gewichts-Tripel einmal und verwendet die bestehenden
+MXFP4-2x/4x-Kernel für die zugehörigen Spalten. RAM-Hits und fertige SSD-Reads
+werden während weiterer Reads berechnet. Die CUDA-Stufe pinnt alle residenten
+Experten der Union und startet ihre Up/Gate-, Aktivierungs-, Q8- und Down-Kernel
+mit nur einem H2D/D2H-Paar pro Layer. DP4A verarbeitet benachbarte Gewichtsblöcke
+parallel; die Float-Terme werden in der bisherigen GPU-Reihenfolge addiert.
+Die bestehenden Batch-Puffer reichen auch für Deskriptoren: keine zusätzliche
+GPU-Scratch-Reservierung. Routing-Gewichte und Summen bleiben in ursprünglicher
+Slotreihenfolge, einschließlich doppelter IDs.
+
+Es gibt keinen Prefill-Phasenwechsel in diesem Pfad. Ein fortlaufender
+Expert-Mikroschrittzähler hält die Decode-Caches gültig; die Cache-Hitze zählt
+jede Token-Auswahl eines Union-Experten. Der Next-Layer-Prefetch enthält die
+vorhergesagte Union aller Eingaben, dedupliziert und nach Router-Rang verflochten.
+Der normale Einzeltoken-Executor bleibt separat. Rohwahrscheinlichkeiten im
+Fast-Verifier sortieren nur die angeforderten Top-N; der Softmax-Nenner umfasst
+weiter alle Vokabulareinträge. Der Ziel-Sampler wird dadurch nicht verändert.
 
 F32-Anforderungen kleiner Float-/BF16-Matrizen nutzen den vorhandenen
 Mehrspalten-Vektorkernel. Insbesondere Router, Kompressionsprojektionen und
@@ -117,7 +135,7 @@ Fixture verlangt RAM-Hits ohne SSD-Reads und bitgleiche Ergebnisse.
 `DSPARK_UNDO_CANARY=1 test-dspark-state-model ...` führt den Realmodell-Canary aus.
 Für 127/128/129, 255/256/257 und 4104 Positionen werden alle Batchbreiten 2..5 und
 alle behaltenen Präfixe geprüft. Nach Reject/Undo/Replay werden Folgelogits mit
-frischen sequentiellen Referenzen und deren Wiederholung verglichen. Full Accept
+frischen, vollständig restaurierten Präfix-Batches und deren Wiederholung verglichen. Full Accept
 wird zusätzlich gegen frische identische Batches geprüft; Batch-/Einzel-
 Numerik wird separat protokolliert. Vor dem Replay müssen die serialisierten
 Cachebytes nach Delta-Undo exakt dem Ausgangszustand entsprechen. Full Accept
@@ -177,3 +195,55 @@ ist 13/13 gleich. Der zusätzliche freie Greedy-Prompt weicht dagegen ab Token 9
 der Sampling-/Penalty-Fall ab Token 17 ab. **Allgemeine Greedy-Tokenparität und
 ein Produktions-Speedup sind nicht nachgewiesen.** Für die höchste gemessene
 Produktionsgeschwindigkeit bleibt der Sidecar ausgeschaltet.
+
+Die Decode-Union-Fixture in `test-kimi-cpu-sink --activation-tests` prüft 2..5
+Spalten bitgenau gegen CPU-Einzeltoken-Ausführung, Cold-Reads pro Expert-Matrix,
+Warm-Hits ohne Reads, doppelte/negative IDs und leere Union. Sie läuft auch ohne
+Ready-first. `test-kimi-mxfp4-chain --decode-only` prüft 1..5 Spalten und drei
+parallele Experten bitgenau gegen den bisherigen CUDA-Reihenkernel, plus ungültige
+Deskriptoren. GPU-Tests nur mit exklusiv übernommener GPU ausführen.
+
+## Messstand K (1. November 2026)
+
+Der Mehrspalten-Decode ist implementiert; das Ziel von etwa 150 ms für zwei
+Verifier-Eingaben und mehr als 11 tok/s wurde nicht erreicht. Die aus der
+Suchmatrix ausgewählte Konfiguration ist k=3, `-t 8 -tb 8`, Prefetch 4 und
+`--mtp-confidence 0`. Drei finale Läufe desselben Builds K10 liefern
+7,726 / 7,985 / 7,802 tok/s letzte128: **7,84 ± 0,13 tok/s** (Stichprobenstreuung,
+n=3). Die beiden vollständigen Off-Kontrollen desselben Builds liefern
+8,408 / 8,444 tok/s. Alle drei MTP-Läufe sind nach unverändertem `vergleich.py`
+GLEICHWERTIG (Präfix 228/228/256; mean Δlogprob 0,01031/0,00977/0,00961).
+Für die höchste gemessene 4K-Geschwindigkeit bleibt Produktion ohne Sidecar.
+
+Die vollständige k-Matrix auf K8/Off8 (12 Threads, Prefetch 4) ist ebenfalls
+GLEICHWERTIG: Off 8,390; k1 7,993; k2 7,496; k3 8,070; k4 7,159 tok/s.
+Confidence 0,5 erreicht dort 7,885; Confidence 0,8 auf K9 mit acht Threads
+8,101 tok/s. Der höchste Suchlauf ist k3/T8/P4 mit 8,166 tok/s; er ersetzt
+nicht die genannten drei Abschlusswiederholungen.
+
+Im warmen k1-Verifier liegen median 205,6 ms für Hauptgraph/Undo/Transport an,
+gegenüber ungefähr 248 ms in J. Zwei Tokens wählen im Mittel 10,36 verschiedene
+Experten pro Layer, gegenüber 12 getrennten Expert-Durchläufen: nur 13,7 %
+weniger Gewichtsdurchläufe. Die SSD-Bedarfsreads bleiben median 969 MB pro Block,
+vor zusätzlichem Prefetch. Top-N-Teilsortierung senkt die Accept-/Rohprob-Ausgabe
+von ungefähr 15 auf 1,3 ms. Ein kleiner Draftgraph wird weiterhin aufgebaut;
+Aufbau und Scheduler-Allokation liegen jeweils deutlich unter einer Millisekunde.
+
+CPU-Canary mit Batch-Präfix-Replay: 70 bytegenaue Restores, 28 unveränderte
+Full-Accept-Discards und alle Folgelogits exakt gegen frische Präfix-Batches.
+Auto-VRAM: dieselben 70/28 Byteprüfungen und alle Forward-Vergleiche innerhalb
+des unabhängigen Kontrollbereichs. Alle Positionen und Breiten wie oben.
+Die Rohlogit-Kontrollgrenzen bleiben unverändert; das 4K-Logprob-Kriterium ebenso.
+Sechs relevante CTests, die vollständige CPU-Aktivierungs-Fixture, der direkte
+CUDA-Bitvergleich und der Mock-Tier-Prefetch-Test bestehen. Der 80-Experten-
+Tabellentest prüft Heat-Multiplizität, Ready-Leases und Masken über Bit 31 hinaus.
+
+64 kategoriale Seeds pro Modus: Off A/B/C/D=12/20/28/4, MTP=13/17/31/3,
+Totalvariation 0,0625, Sanity bestanden. 323/324 Post-Prob-Zeilen sowie die
+Rohprob-Zeilen der freien Tests sind gültig. Freier Greedy96 divergiert ab
+Token 11, Sampling96 ab 17; Grammar13 ist gleich. Das ist keine allgemeine
+Greedy-Paritäts- oder universelle Verteilungszusage. CPU-Off/Strict bleibt bei
+16/16/13 Tokens einschließlich sämtlicher Post-Probs exakt. Stream-Abbruch nach
+drei Tokens mit anschließender vollständiger 16-Token-/16-Probs-Anfrage besteht.
+Alle Optimierungsmessungen verwenden Kontext 8192, nicht den langen
+Produktionskontext 524288. Änderungen sind lokal, nicht installiert/gepusht.

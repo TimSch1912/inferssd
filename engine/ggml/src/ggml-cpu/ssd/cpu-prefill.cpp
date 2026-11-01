@@ -447,12 +447,12 @@ extern "C" struct kimi_cpu_prefill * kimi_cpu_prefill_create(
 
 extern "C" void kimi_cpu_prefill_destroy(struct kimi_cpu_prefill * prefill) { delete prefill; }
 
-extern "C" bool kimi_cpu_prefill_run_activation(
+static bool grouped_run_activation(
         struct kimi_cpu_prefill * prefill,
         const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
         const float * input, const int32_t * ids, const float * weights, int nslots, int ntokens,
         const struct kimi_cpu_sink_activation * activation, float * output,
-        struct kimi_cpu_prefill_stats * stats, char * error, size_t error_size) {
+        struct kimi_cpu_prefill_stats * stats, char * error, size_t error_size, bool decode) {
     prefill_error(error, error_size, "");
     if (stats) { *stats = {}; }
     if (!prefill) { prefill_error(error, error_size, "null CPU prefill"); return false; }
@@ -462,19 +462,19 @@ extern "C" bool kimi_cpu_prefill_run_activation(
     try {
         // Disable decode cache use and check optional retention headroom before
         // allocating workspace, including direct calls outside graph hooks.
-        if (!kimi_cpu_sink_cache_begin(prefill->sink, 0, 0, false, error, error_size)) { return false; }
+        if (!decode && !kimi_cpu_sink_cache_begin(prefill->sink, 0, 0, false, error, error_size)) { return false; }
         if (!input || !output || nslots < 0 || nslots > 16 || (nslots && (!ids || !weights)) ||
-                ntokens < 1 || (nslots && ntokens > std::numeric_limits<int>::max() / nslots) ||
+                (decode && (ntokens < 2 || ntokens > 5)) || ntokens < 1 || (nslots && ntokens > std::numeric_limits<int>::max() / nslots) ||
                 !prefill_activation_valid(activation)) {
             throw std::runtime_error("CPU prefill requires a positive token count, 0..16 slots and a valid activation");
         }
         // The elastic tier must make room for the actual GPU accumulator before
         // the SSD ring is started. A worker allocation failure cannot strand
         // streamed GPU reads holding ring credits.
-        if (!kimi_cpu_sink_vram_reserve_accumulator(prefill->sink, ntokens, error, error_size)) { return false; }
+        if (!decode && !kimi_cpu_sink_vram_reserve_accumulator(prefill->sink, ntokens, error, error_size)) { return false; }
         // A lazily-created sink may have missed the context's post-reserve hook;
         // repeated layer calls are harmless. Disarm after the accumulator is ready.
-        if (!kimi_cpu_sink_vram_phase_complete(prefill->sink, false, error, error_size)) { return false; }
+        if (!decode && !kimi_cpu_sink_vram_phase_complete(prefill->sink, false, error, error_size)) { return false; }
         prefill->activation_config = *activation;
         prefill->prepare(up, gate, down, ids, weights, nslots, ntokens);
         if (prefill->active_mxfp4_gemm == 2 && prefill->group_trace) {
@@ -531,6 +531,9 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         batch.ntokens = ntokens;
         batch.activation = *activation;
         batch.output = output;
+        batch.decode = decode;
+        batch.routed_output = prefill->routed_output.data();
+        batch.consumed = prefill->consumed.data();
         const bool ok = kimi_cpu_sink_stream_hybrid(prefill->sink, up, gate, down,
                 prefill->expert_ids.empty() ? &empty_id : prefill->expert_ids.data(),
                 static_cast<int>(prefill->expert_ids.size()), &batch, kimi_cpu_prefill::consume, prefill,
@@ -584,6 +587,26 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         prefill_error(error, error_size, e.what());
         return false;
     }
+}
+
+extern "C" bool kimi_cpu_prefill_run_activation(
+        struct kimi_cpu_prefill * prefill,
+        const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+        const float * input, const int32_t * ids, const float * weights, int nslots, int ntokens,
+        const struct kimi_cpu_sink_activation * activation, float * output,
+        struct kimi_cpu_prefill_stats * stats, char * error, size_t error_size) {
+    return grouped_run_activation(prefill, up, gate, down, input, ids, weights, nslots, ntokens,
+        activation, output, stats, error, error_size, false);
+}
+
+extern "C" bool kimi_cpu_decode_run_activation(
+        struct kimi_cpu_prefill * prefill,
+        const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
+        const float * input, const int32_t * ids, const float * weights, int nslots, int ntokens,
+        const struct kimi_cpu_sink_activation * activation, float * output,
+        struct kimi_cpu_prefill_stats * stats, char * error, size_t error_size) {
+    return grouped_run_activation(prefill, up, gate, down, input, ids, weights, nslots, ntokens,
+        activation, output, stats, error, error_size, true);
 }
 
 extern "C" bool kimi_cpu_prefill_run(

@@ -108,7 +108,7 @@ struct kimi_vram_expert_format {
     const int32_t * layers;   // model layer IDs, allocation priority order
 };
 struct kimi_vram_format_api {
-    uint32_t version, size;   // 1
+    uint32_t version, size;   // 2
     int (*prepare)(void * context, const struct kimi_vram_request * requests, int count,
                    const struct kimi_vram_expert_format * format, int * slots,
                    char * error, size_t error_size);
@@ -117,6 +117,14 @@ struct kimi_vram_format_api {
     // format engine documents that requirement (IQ2_XXS/Q2_K).
     int (*launch)(void * context, const void * input, size_t input_bytes,
                   const struct kimi_vram_activation * activation, char * error, size_t error_size);
+    // Decode union (<=80 distinct experts), Q8_0 MXFP4 input, 2..5 tokens.
+    // prepare_batch uses request.weight as routed-token count; finish_batch returns unweighted rows.
+    int (*prepare_batch)(void *, const struct kimi_vram_request *, int,
+                         const struct kimi_vram_expert_format *, int *, char *, size_t);
+    int (*launch_batch)(void *, const void *, size_t, const int32_t *, int, int,
+                        const struct kimi_vram_activation *, char *, size_t);
+    // Unweighted rows for each flattened token/slot route; CPU routes untouched.
+    int (*finish_batch)(void *, float *, size_t, char *, size_t);
 };
 // One host-resident expert selected for transient GPU prefill compute. The
 // request index addresses the distinct-expert union passed to prepare. RAM

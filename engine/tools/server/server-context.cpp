@@ -1704,7 +1704,7 @@ private:
         return slot.has_next_token;
     }
 
-    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx, bool top_only = false) const {
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
 
         if (post_sampling) {
@@ -1731,7 +1731,7 @@ private:
             }
         } else {
             // TODO: optimize this with min-p optimization
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx, idx);
+            std::vector<llama_token_data> cur = get_token_probabilities(ctx, idx, top_only ? n_probs_request : 0);
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
@@ -2259,7 +2259,7 @@ private:
             completion_token_output out;
             out.tok = token; out.prob = 1.0f;
             if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot,out,slot.task->params.post_sampling_probs,params_base.special,row);
+                populate_token_probs(slot,out,slot.task->params.post_sampling_probs,params_base.special,row,true);
             }
             outputs.push_back(std::move(out)); accepted.push_back(token);
             if (llama_vocab_is_eog(vocab,token) || i == slot.spec_draft.size() || token != slot.spec_draft[i]) { break; }
@@ -2272,15 +2272,13 @@ private:
         slot.prompt.tokens.push_back(slot.sampled);
         slot.prompt.tokens.insert({accepted.begin(),accepted.end()-1});
         if (reject) {
-            // No target re-decision: only rebuild state for the already chosen input prefix.
-            auto replay = llama_batch_init(1,0,1);
-            bool ok = true;
-            for (size_t i = 0; i < accepted.size() && ok; ++i) {
-                common_batch_clear(replay);
+            // No target re-decision: rebuild the chosen prefix in one decode, including its feature rows.
+            auto replay = llama_batch_init(accepted.size(),0,1);
+            for (size_t i = 0; i < accepted.size(); ++i) {
                 common_batch_add(replay,i ? accepted[i-1] : slot.sampled,pos0+i,{slot.id},false);
-                ok = llama_decode(slot.ctx,replay) == 0 && common_speculative_process(slot.spec.get(),replay,slot.id);
-                if (ok) { metrics.on_decoded(slots); }
             }
+            const bool ok = llama_decode(slot.ctx,replay) == 0 && common_speculative_process(slot.spec.get(),replay,slot.id);
+            if (ok) { metrics.on_decoded(slots); }
             llama_batch_free(replay);
             if (!ok) { throw std::runtime_error("failed DSpark committed-prefix replay"); }
         }

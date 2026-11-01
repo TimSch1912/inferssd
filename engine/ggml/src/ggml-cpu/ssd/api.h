@@ -38,6 +38,7 @@ struct api_v2 {
         uint64_t, uint64_t, uint64_t) noexcept;
     bool (*attach_services)(ggml_backend_t, const ssd::runtime_services *) noexcept;
     size_t runtime_services_size;
+    decltype(&kimi_cpu_decode_run_activation) decode_run_activation;
 };
 using get_api_v2 = const api_v2 * (*)();
 
@@ -63,6 +64,6 @@ inline bool valid(const api_v2 * api) noexcept {
         api->prefill_run &&
         api->prefill_run_activation &&
         api->prefill_destroy &&
-        api->take_room && api->attach_services;
+        api->take_room && api->attach_services && api->decode_run_activation;
 }
 } } // namespace ssd::cpu

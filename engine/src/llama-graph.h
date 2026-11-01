@@ -775,6 +775,7 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_dspark_confidence = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [nextn_width, rows], DSpark: 3*n_embd HC input features
 
     std::vector<ggml_tensor *> t_layer_inp;

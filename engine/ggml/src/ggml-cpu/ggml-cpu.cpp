@@ -726,6 +726,7 @@ static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
         &ssd::cpu::take_room_configured,
         &ggml_backend_cpu_set_ssd_runtime_services,
         sizeof(ssd::runtime_services),
+        &kimi_cpu_decode_run_activation,
     };
     return &api;
 }

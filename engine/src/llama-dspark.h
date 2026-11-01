@@ -26,4 +26,5 @@ struct llama_dspark_input {
     int32_t n_context;
     llama_token known;
     int32_t n_drafts;
+    bool confidence = false;
 };

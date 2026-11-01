@@ -348,7 +348,7 @@ json format_response_rerank(
 // other utils
 //
 
-std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx);
+std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t top_n = 0);
 
 std::string safe_json_to_str(const json & data);
 

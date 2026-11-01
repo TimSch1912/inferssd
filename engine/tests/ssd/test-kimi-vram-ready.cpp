@@ -42,5 +42,24 @@ int main() { try {
     next = table.acquire_ready(&r,1,&ready);
     require(next > generation && ready == 0, "clear recycled a confirmation");
     table.abort(); rejected([&] { table.validate_ready(next); });
+    // A decode union can exceed the single-token mask width. Fetch/lease once,
+    // but train retention with each expert's routed-token multiplicity.
+    vram_slot_table decode(80,{1},true,0,false,32);
+    std::vector<kimi_vram_request> union80(80,r);
+    for (int i=0; i<80; ++i) { union80[i].expert=i;union80[i].weight=1+i%5; }
+    decode.next_token();decode.prepare(union80.data(),80,UINT32_MAX,true);
+    for (int i=0; i<80; ++i) {
+        require(decode.layers[1].counts[i]==union80[i].weight,"decode union lost token multiplicity");
+        decode.publish(i);
+    }
+    decode.finish();
+    std::vector<int> ready80(80);
+    next=decode.acquire_ready(union80.data(),80,ready80.data());
+    require(std::count(ready80.begin(),ready80.end(),1)==80,"large decode union lost a resident lease");
+    decode.release_ready(next);
+    decode.next_token();decode.prepare(union80.data(),80,1);
+    require(decode.hits[0]>=0 && std::count(decode.hits.begin(),decode.hits.end(),-1)==79,"masked union selected experts above bit 31");
+    decode.finish();
+    rejected([&] { decode.prepare(union80.data(),81); });
     std::printf("VRAM_READY_LEASE_PASS assertions=%d\n", checks); return 0;
 } catch (const std::exception & e) { std::fprintf(stderr,"READY_LEASE_FAIL: %s\n",e.what()); return 1; } }

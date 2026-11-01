@@ -195,8 +195,9 @@ public:
         }
         return l.counts[e.key.expert]*l.score_factor;
     }
-    void prepare(const kimi_vram_request * input,size_t n,uint32_t demand_mask=UINT32_MAX) {
-        if(in_flight || lease_generation || !step || n>16)throw std::runtime_error("invalid VRAM prepare phase");
+    void prepare(const kimi_vram_request * input,size_t n,uint32_t demand_mask=UINT32_MAX,bool route_counts=false) {
+        if(in_flight || lease_generation || !step || n>80)throw std::runtime_error("invalid VRAM prepare phase");
+        const auto demanded = [&](size_t j) { return demand_mask == UINT32_MAX || (j < 32 && (demand_mask & (1u << j))); };
         if(n)requests.assign(input,input+n);else requests.clear();
         hits.assign(n,-1);admissions.assign(n,-1);
         if(n==0){in_flight=true;return;}
@@ -209,7 +210,7 @@ public:
             const double factor=std::exp2(-double(step-l.observed)/half_life);
             for(auto & value:l.counts)value*=factor;
             std::vector<bool> seen(static_cast<size_t>(experts), false);
-            for(size_t j=0;j<n;++j){const auto & r=requests[j];if((demand_mask&(1u<<j))&&!seen[r.expert]){l.counts[r.expert]+=1;seen[r.expert]=true;}}
+            for(size_t j=0;j<n;++j){const auto & r=requests[j];if(demanded(j)&&!seen[r.expert]){l.counts[r.expert]+=route_counts?r.weight:1;seen[r.expert]=true;}}
             l.observed=step;
             l.score_step=step;l.score_factor=1;
         }
@@ -218,7 +219,7 @@ public:
         // first hit stands where an admission's miss would: from it on the
         // entry earns, and is accounted, as one admitted at this count.
         for(size_t j=0;j<n;++j)for(size_t i=l.begin;i<l.begin+l.count;++i) {
-            if(!(demand_mask&(1u<<j)))continue;
+            if(!demanded(j))continue;
             auto & e=slots[i];
             if(e.valid && same(e.key,requests[j])){
                 e.locked=true;e.touched=++clock;hits[j]=int(i);
@@ -228,7 +229,7 @@ public:
             }
         }
         std::vector<size_t> order;
-        for(size_t i=0;i<n;++i)if((demand_mask&(1u<<i))&&hits[i]<0)order.push_back(i);
+        for(size_t i=0;i<n;++i)if(demanded(i)&&hits[i]<0)order.push_back(i);
         std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b){
             return count_decay && l.counts[requests[a].expert]>l.counts[requests[b].expert];
         });
@@ -334,7 +335,7 @@ public:
         in_flight=false;
     }
     uint64_t acquire_ready(const kimi_vram_request * input, size_t n, int * ready) {
-        if (in_flight || lease_generation || native_pinned() || n > 16 || (n && (!input || !ready)) || next_generation == UINT64_MAX)
+        if (in_flight || lease_generation || native_pinned() || n > 80 || (n && (!input || !ready)) || next_generation == UINT64_MAX)
             throw std::runtime_error("invalid VRAM ready lease phase");
         std::vector<int> found(n, -1);
         const uint64_t generation = acquire_slots(input, n, found.data());

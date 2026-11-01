@@ -123,7 +123,7 @@ struct sink_vram {
         }
         if (configuration.gpu.format) {
             format = configuration.gpu.format;
-            if (!format || format->version != 1 || format->size != sizeof(*format) || !format->prepare || !format->launch) {
+            if (!format || format->version != 2 || format->size != sizeof(*format) || !format->prepare || !format->launch) {
                 throw std::runtime_error("GPU tier explicit-format ABI mismatch");
             }
         }
@@ -284,18 +284,18 @@ struct sink_vram {
     }
     // Expert geometry is supplied through the explicit-format extension.
     void prepare(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * down,
-                 int latent, int hidden, const std::vector<int32_t> & layer_ids, sink_cache & cache, bool unweighted = false) {
+                 int latent, int hidden, const std::vector<int32_t> & layer_ids, sink_cache & cache, bool unweighted = false, bool batch = false) {
         hits = 0;
         if (!context) { return; }
         place_threads();
         int layer = -1, consumed = 0;
         const char * tensor_name = up->name;
         if (std::sscanf(tensor_name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) != 1 ||
-                !consumed || tensor_name[consumed] || source.size() > 16 ||
+                !consumed || tensor_name[consumed] || source.size() > (batch ? 80 : 16) ||
                 (layer < 0 || layer > 1023)) {
             throw std::runtime_error("GPU tier requires a canonical routed layer and <=16 slots");
         }
-        if (!format) {
+        if (!format || (batch && (!format->prepare_batch || !format->launch_batch || !format->finish_batch))) {
             throw std::runtime_error("GPU tier lacks the explicit expert format ABI for these experts; no fallback");
         }
         if (deferred_upload && decode) {
@@ -305,7 +305,7 @@ struct sink_vram {
         upload_queued.assign(source.size(), 0);
         requests.resize(source.size()); slots.assign(source.size(), -1);
         for (size_t i = 0; i < source.size(); ++i) {
-            auto & r = requests[i]; r.layer = layer; r.expert = source[i].id; r.weight = unweighted ? 1.0f : source[i].weight;
+            auto & r = requests[i]; r.layer = layer; r.expert = source[i].id; r.weight = batch ? float(source[i].prefill_routes) : unweighted ? 1.0f : source[i].weight;
             for (int role = 0; role < 3; ++role) {
                 const auto k = sink_cache::key(source[i].role[role]);
                 r.role[role] = { k.device, k.inode, k.size, k.offset, k.bytes,
@@ -320,12 +320,29 @@ struct sink_vram {
             const bool mxfp4 = up->type == GGML_TYPE_MXFP4 && down->type == GGML_TYPE_MXFP4;
             const kimi_vram_expert_format f = { latent, hidden, int32_t(up->type), int32_t(down->type),
                 int32_t(up->ne[2]), int32_t(layer_ids.size()), layer_ids.data() };
-            result = format->prepare(context, requests.data(), int(requests.size()), &f, slots.data(), error, sizeof(error));
+            result = (batch ? format->prepare_batch : format->prepare)(context, requests.data(), int(requests.size()), &f, slots.data(), error, sizeof(error));
             format_f32_input = !mxfp4;
         }
         format_path = true;
         check(result, error);
         for (size_t i = 0; i < source.size(); ++i) { source[i].vram_slot = slots[i]; hits += slots[i] >= 0; }
+    }
+    void launch_batch(const kimi_cpu_sink_prefill_batch & batch) {
+        if (!context) { return; }
+        char error[512] = {};
+        const kimi_vram_activation a = { batch.activation.kind, batch.activation.situ_beta,
+            batch.activation.situ_linear_beta, batch.activation.swiglu_limit };
+        check(format->launch_batch(context, batch.quantized_input, batch.quantized_stride,
+            batch.route_request_index, batch.nslots, batch.ntokens, &a, error, sizeof(error)), error);
+    }
+    void finish_batch(float * routes, size_t stride, sink_cache & cache, const std::vector<sink_request> & source) {
+        if (!context) { return; }
+        char error[512] = {};
+        check(format->finish_batch(context, routes, stride, error, sizeof(error)), error);
+        retain_deferred(cache, source);
+        release_ram_batch(cache);
+        drop_ready(cache, source);
+        if (deferred_upload) { collect_deferred(cache, -2); }
     }
     void launch(const void * quantized, size_t quantized_bytes, const float * f32, size_t f32_bytes,
                 const kimi_cpu_sink_activation & activation) {
@@ -846,7 +863,7 @@ struct sink_vram {
     void drop_ready(sink_cache & cache,const std::vector<sink_request> & source) {
         if (!exclusive || source.empty()) { return; }
         char error[512]={};
-        int ready[16] = {}; kimi_vram_ready_lease lease = {};
+        int ready[80] = {}; kimi_vram_ready_lease lease = {};
         int rc = residency->acquire(context, epoch, requests.data(), int(requests.size()), &lease, ready, error, sizeof(error));
         check(rc, error);
         rc = residency->validate(context, &lease, error, sizeof(error)); check(rc, error);

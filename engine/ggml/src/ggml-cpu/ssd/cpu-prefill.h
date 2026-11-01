@@ -62,6 +62,15 @@ GGML_BACKEND_API bool kimi_cpu_prefill_run_activation(
         const struct kimi_cpu_sink_activation * activation, float * output,
         struct kimi_cpu_prefill_stats * stats, char * error, size_t error_size);
 
+// Same grouped kernels for a 2..5-token decode, retaining the decode caches.
+GGML_BACKEND_API bool kimi_cpu_decode_run_activation(
+        struct kimi_cpu_prefill * prefill,
+        const struct ggml_tensor * up, const struct ggml_tensor * gate,
+        const struct ggml_tensor * down, const float * input,
+        const int32_t * ids, const float * weights, int nslots, int ntokens,
+        const struct kimi_cpu_sink_activation * activation, float * output,
+        struct kimi_cpu_prefill_stats * stats, char * error, size_t error_size);
+
 // Compatibility wrapper for Kimi-K3 SiTU callers.
 GGML_BACKEND_API bool kimi_cpu_prefill_run(
         struct kimi_cpu_prefill * prefill,

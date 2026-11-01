@@ -763,7 +763,10 @@ struct expert_cache {
                     if (requests[j].cache_only) { continue; }
                     const auto duplicate = std::find_if(requests.begin(), requests.begin() + j,
                         [&](const expert_request & r) { return r.id == requests[j].id; });
-                    if (duplicate == requests.begin() + j) { l.count_frequency[requests[j].id] += 1.0; }
+                    if (duplicate == requests.begin() + j) {
+                        // A decode union fetches once, but every routed token trains retention.
+                        l.count_frequency[requests[j].id] += std::max(1, requests[j].prefill_routes);
+                    }
                 }
             } catch (const std::bad_alloc &) { pause(requests, current, "count_frequency_allocation_failed"); return; }
             frequency_ticket.value.commit();

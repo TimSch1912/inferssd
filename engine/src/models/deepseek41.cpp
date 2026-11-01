@@ -1369,13 +1369,27 @@ void llm_build_deepseek41::build_dspark(const llama_dspark_input & input) {
     hidden = ggml_view_2d(ctx0, hidden, n_embd, input.n_drafts, hidden->nb[1], 0);
     auto * base = build_lora_mm(model.output, build_norm(hidden, mtp.norm, nullptr, LLM_NORM_RMS, -1));
     auto * previous = ggml_view_1d(ctx0, res->t_inp_tokens, 1, 0);
-    ggml_tensor * logits = nullptr;
+    ggml_tensor * logits = nullptr, * confidence = nullptr;
+    auto * confidence_weight = input.confidence ? ggml_cast(ctx0, mtp.confidence, GGML_TYPE_F32) : nullptr;
     for (int i = 0; i < input.n_drafts; ++i) {
         auto * row = ggml_view_2d(ctx0, base, base->ne[0], 1, base->nb[1], i*base->nb[1]);
         auto * markov = ggml_get_rows(ctx0, mtp.markov_embd, previous);
+        if (input.confidence) {
+            auto * h = ggml_view_2d(ctx0, hidden, n_embd, 1, hidden->nb[1], i*hidden->nb[1]);
+            auto * score = ggml_mul_mat(ctx0, confidence_weight,
+                ggml_concat(ctx0, h, markov, 0));
+            ggml_prec_set_acc(score, GGML_PREC_F32);
+            score = ggml_sigmoid(ctx0, score);
+            confidence = confidence ? ggml_concat(ctx0, confidence, score, 1) : score;
+        }
         row = ggml_add(ctx0, row, build_lora_mm(mtp.markov_output, markov));
         previous = ggml_argmax(ctx0, row);
         logits = logits ? ggml_concat(ctx0, logits, row, 1) : row;
+    }
+    if (confidence) {
+        res->t_dspark_confidence = confidence;
+        ggml_set_output(confidence);
+        ggml_build_forward_expand(gf, confidence);
     }
     cb(logits, "dspark_logits", -1);
     res->t_logits = logits;

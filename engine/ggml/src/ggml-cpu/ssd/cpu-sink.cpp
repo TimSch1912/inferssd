@@ -2377,7 +2377,7 @@ struct kimi_cpu_sink {
 
     void prepare(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
                  const int32_t * ids, const float * weights, int nslots, bool use_cache = true,
-                 const uint8_t * cache_only = nullptr) {
+                 const uint8_t * cache_only = nullptr, bool batch = false) {
         const ggml_tensor * tensors[] = { up, gate, down };
         for (const auto * tensor : tensors) {
             if (!tensor || !ggml_is_contiguous(tensor) ||
@@ -2415,6 +2415,7 @@ struct kimi_cpu_sink {
             }
             sink_request request = {};
             request.weight = weights[slot];
+            request.prefill_routes = batch ? int(weights[slot]) : 0;
             request.id = ids[slot];
             request.cache_only = cache_only && cache_only[slot];
             for (int role = 0; role < 3; ++role) {
@@ -2440,7 +2441,7 @@ struct kimi_cpu_sink {
             }
             requests.push_back(request);
         }
-        if (use_cache && ready_first) {
+        if (use_cache && (ready_first || batch)) {
             // nslots <= 1024 and latent <= 16384: at most 64 MiB. Allocate
             // before the cache admission check so memory.current includes it.
             resize_scratch(expert_output, requests.size() * size_t(latent));
@@ -2488,7 +2489,7 @@ struct kimi_cpu_sink {
                 if (vram.context && !cache.arena) {
                     vram.set_host_demand(cache.pending_bytes(max_bytes[0] + max_bytes[1] + max_bytes[2]));
                 }
-                vram.prepare(requests, up, down, latent, hidden, vram_layers, cache, post_exp_norm != nullptr);
+                vram.prepare(requests, up, down, latent, hidden, vram_layers, cache, post_exp_norm != nullptr || batch, batch);
             }
             // Auto sizing reads memory.current. After GPU prefill, the CPU
             // read ring may still be absent or only virtually allocated. Its
@@ -2849,6 +2850,153 @@ void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
     sink->parallel_phase(function, userdata, true);
 }
 
+// Small decode shares the grouped CPU kernels and the decode cache's read/admission lifecycle.
+static bool sink_stream_decode(kimi_cpu_sink * sink, const ggml_tensor * up, const ggml_tensor * gate,
+        const ggml_tensor * down, const int32_t * ids, int nexperts, kimi_cpu_sink_prefill_batch & batch,
+        kimi_cpu_sink_consumer_fn consumer, void * userdata, kimi_cpu_sink_stats * stats,
+        char * error, size_t error_size) {
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
+    const auto start = sink_clock::now();
+    const uint64_t completed_before = sink->ring.completed();
+    sink->current = {};
+    sink->requests.clear();
+    sink->begin_observation(up, true);
+    try {
+        sink->begin_participants(true);
+        if (sink->poisoned || nexperts < 0 || nexperts > 80 || batch.ntokens < 2 || batch.ntokens > 5 ||
+                !ids || !consumer || batch.nslots<0 || batch.nslots>16 ||
+                (nexperts && !batch.consumed) || (batch.nslots && (!batch.routed_output || !batch.route_request_index))) {
+            throw std::runtime_error("invalid decode union");
+        }
+        int layer = -1;
+        if (up) { std::sscanf(up->name, "blk.%d.ffn_up_exps.weight", &layer); }
+        sink->prefetch_drain(layer, ids, nexperts);
+        sink->mrc.observe(layer, ids, nexperts);
+        sink->post_exp_norm = batch.activation.post_exp_norm;
+        sink->activation_kind = batch.activation.kind;
+        sink->beta = batch.activation.situ_beta; sink->linear_beta = batch.activation.situ_linear_beta;
+        sink->swiglu_limit = batch.activation.swiglu_limit;
+        std::vector<float> weights(size_t(nexperts), 0.0f);
+        for (int t=0; t<batch.ntokens; ++t) {
+            for (int k=0; k<batch.nslots; ++k) {
+                const int expert=batch.route_request_index[t*batch.nslots+k];
+                if (expert<0) { continue; }
+                bool first=true;
+                for (int previous=0; previous<k; ++previous) {
+                    first &= batch.route_request_index[t*batch.nslots+previous]!=expert;
+                }
+                if (first) { weights[size_t(expert)]+=1.0f; }
+            }
+        }
+        sink->prepare(up, gate, down, ids, weights.data(), nexperts, true, nullptr, true);
+        sink->prefetch_keep_used_hits();
+        sink->prefetch_count_used();
+        batch.gpu_experts = sink->vram.hits;
+        batch.ram_experts = sink->current.cache_hits;
+        batch.ram_bytes = sink->current.cache_hit_bytes;
+        batch.ssd_experts = sink->io_requests.size();
+        if (sink->timeline_active) {
+            sink->timeline.resize(sink->requests.size());
+            for (auto & t : sink->timeline) { t.workers.resize(2 * size_t(sink->threads)); }
+        }
+        {
+            std::lock_guard<std::mutex> lock(sink->io_mutex);
+            sink->io_error.clear(); sink->io_cancel = false;
+            if (!sink->io_requests.empty()) { sink->io_done = false; sink->io_job = true; }
+        }
+        sink->io_cv.notify_one();
+        sink->vram.launch_batch(batch);
+        sink->prefetch_schedule(up, !sink->io_requests.empty());
+        const size_t cpu_experts = sink->requests.size() - size_t(sink->vram.hits);
+        for (size_t ordinal = 0; ordinal < cpu_experts; ++ordinal) {
+            size_t expert = 0;
+            const auto wait = sink_clock::now();
+            {
+                std::unique_lock<std::mutex> lock(sink->io_mutex);
+                sink->io_cv.wait(lock, [&] {
+                    // No early-up-gate: the grouped consumer reads all three roles.
+                    for (expert=0; expert<sink->requests.size(); ++expert) {
+                        const auto & r=sink->requests[expert];
+                        const auto & slot=sink->slots[r.io_slot];
+                        if (!sink->expert_computed[expert] &&
+                                ((r.cache_hit>=0 && sink->prefetch_hit_state(r.cache_hit)==1) ||
+                                 (slot.state==sink_slot::ready && slot.request==expert))) { return true; }
+                    }
+                    return !sink->io_error.empty();
+                });
+                if (!sink->io_error.empty()) { throw std::runtime_error(sink->io_error); }
+                sink->expert_computed[expert]=1;
+            }
+            sink->current.wait_io_us += elapsed_us(wait);
+            auto & request = sink->requests[expert];
+            auto & slot = sink->slots[request.io_slot];
+            const auto compute = sink_clock::now();
+            const void * data[3];
+            for (int role = 0; role < 3; ++role) {
+                data[role] = static_cast<const char *>(request.cache_hit >= 0 ? sink->cache.data(request.cache_hit, role) :
+                    request.read_target[role]) + request.role[role].data_offset;
+            }
+            const bool borrow = request.cache_hit >= 0 || request.cache_admit >= 0;
+            bool uploading = sink->vram.async_upload && borrow;
+            if (uploading) { sink->vram.admit(expert, data, true); }
+            sink->timeline_expert = expert;
+            consumer(userdata, expert, data[0], data[1], data[2]);
+            sink->current.compute_us += elapsed_us(compute);
+            if (!uploading) { sink->vram.admit(expert, data, borrow); }
+            sink->cache.admit(request, sink->current);
+            if (request.cache_hit < 0) {
+                std::lock_guard<std::mutex> lock(sink->io_mutex);
+                slot.state = sink_slot::empty;
+            }
+            sink->io_cv.notify_one();
+        }
+        {
+            std::unique_lock<std::mutex> lock(sink->io_mutex);
+            sink->io_cv.wait(lock, [&] { return sink->io_done; });
+            if (!sink->io_error.empty()) { throw std::runtime_error(sink->io_error); }
+        }
+        sink->vram.finish_batch(batch.routed_output, size_t(sink->latent), sink->cache, sink->requests);
+        // GPU rows use the same original slot order as CPU rows, including duplicate expert routes.
+        for (int route = 0; route < batch.ntokens * batch.nslots; ++route) {
+            const int expert = batch.route_request_index[route];
+            if (expert < 0) { continue; }
+            if (sink->requests[size_t(expert)].vram_slot < 0) {
+                if (sink->requests[size_t(expert)].cache_hit >= 0) { ++batch.ram_routes; }
+                else { ++batch.ssd_routes; }
+                continue;
+            }
+            ++batch.gpu_routes;
+            float * values = batch.routed_output + size_t(route) * sink->latent;
+            if (batch.activation.post_exp_norm) {
+                kimi_cpu_sink_normalize_expert(values, sink->latent, batch.activation.post_exp_norm, batch.activation.post_exp_norm_eps);
+            }
+            for (int row = 0; row < sink->latent; ++row) {
+                volatile float scaled = values[row] * batch.weights[route];
+                values[row] = scaled;
+            }
+            batch.consumed[expert] = 1;
+        }
+        ssd::place::observe_read_rate(sink->learning, sink->current.read_bytes, sink->current.io_us);
+        batch.ssd_bytes = sink->current.read_bytes;
+        if (cpu_experts) { sink->learning.cpu_expert_us = sink->current.compute_us / cpu_experts; }
+        sink->report_miss_cost();
+        sink->current.total_us = elapsed_us(start);
+        sink->current.read_completions = sink->ring.completed() - completed_before;
+        sink->current.pending_reads = sink->ring.pending();
+        sink->finish_observation();
+        if (stats) { *stats = sink->current; }
+        sink->print_observation(true);
+        const auto published = sink->publish_observation(true);
+        if (!published) { throw std::runtime_error(published.error); }
+        sink->timeline_active = false; // the following token reduction has no per-expert timeline slot
+        return true;
+    } catch (const std::exception & e) {
+        sink->cancel_and_wait(); sink->prefetch_drain(); sink->cache.release();
+        sink_error(error, error_size, e.what());
+        return false;
+    }
+}
+
 bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         const struct ggml_tensor * up, const struct ggml_tensor * gate,
         const struct ggml_tensor * down, const int32_t * ids, int nexperts,
@@ -2858,6 +3006,9 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
     sink_error(error, error_size, "");
     if (stats) { *stats = {}; }
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
+    if (batch && batch->decode) {
+        return sink_stream_decode(sink, up, gate, down, ids, nexperts, *batch, consumer, userdata, stats, error, error_size);
+    }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     const auto start = sink_clock::now();
     const uint64_t completed_before = sink->ring.completed();

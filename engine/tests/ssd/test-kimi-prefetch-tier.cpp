@@ -51,8 +51,8 @@ const ssd::gpu::provider_v1 * stand_in_provider() {
         tier_prepare, tier_launch, tier_admit, tier_finish, tier_cancel };
     static const kimi_vram_residency_api residency = { 2, sizeof(kimi_vram_residency_api), tier_no_lease,
         tier_no_lease_check, tier_no_lease_check, tier_held };
-    static const kimi_vram_format_api format = { 1, sizeof(kimi_vram_format_api), no_slots,
-        [](void *, const void *, size_t, const kimi_vram_activation *, char *, size_t) { return 0; } };
+    static const kimi_vram_format_api format = { 2, sizeof(kimi_vram_format_api), no_slots,
+        [](void *, const void *, size_t, const kimi_vram_activation *, char *, size_t) { return 0; }, nullptr, nullptr, nullptr };
     static const kimi_vram_prefill_api prefill = { 7, sizeof(kimi_vram_prefill_api), no_slots,
         [](void *) { return 0; },
         [](void *, const void *, size_t, const int32_t *, const float *, int, int, const kimi_vram_prefill_transient *,

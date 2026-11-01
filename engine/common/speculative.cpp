@@ -203,8 +203,8 @@ struct common_speculative_state_dspark : common_speculative_state {
             positions.push_back(p); features.insert(features.end(),it->second.begin(),it->second.end());
         }
         llama_token tokens[4];
-        const int n = llama_dspark_draft_n(ctx, features.data(), positions.data(), positions.size(), known, tokens,
-            params.mtp_strict ? 1 : params.mtp_drafts);
+        const int n = llama_dspark_draft_gated(ctx, features.data(), positions.data(), positions.size(), known, tokens,
+            params.mtp_strict ? 1 : params.mtp_drafts, params.mtp_strict ? 0.0f : params.mtp_confidence);
         result.assign(tokens,tokens+n);
     }
     void accept(uint16_t) override {}

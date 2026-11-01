@@ -3621,6 +3621,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (n < 1 || n > 4) { throw std::invalid_argument("mtp-drafts must be 1..4"); }
             p.speculative.mtp_drafts = n;
         }).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg({"--mtp-confidence"}, "P", "DSpark sigmoid confidence cutoff, 0..1 (0: fixed draft count)",
+        [](common_params & p, const std::string & value) {
+            size_t used = 0;
+            const float cutoff = std::stof(value, &used);
+            if (used != value.size() || !std::isfinite(cutoff) || cutoff < 0.0f || cutoff > 1.0f) {
+                throw std::invalid_argument("mtp-confidence must be finite and in 0..1");
+            }
+            p.speculative.mtp_confidence = cutoff;
+        }).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--spec-draft-model", "-md", "--model-draft"}, "FNAME",
         "draft model for speculative decoding (default: unused)",

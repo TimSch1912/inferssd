@@ -16,7 +16,7 @@ struct expert_request {
     bool vram_ssd_streaming = false;
     int vram_ssd_staging = -1;
     double lane_start_us = 0.0; // MXFP4 grouped prefill: predicted start on its lane (CPU or GPU)
-    int prefill_routes = 0;     // grouped prefill: the expert's distinct tokens
+    int prefill_routes = 0;     // grouped prefill/decode: the expert's distinct tokens
     bool cache_lease = false;
     bool trace_ram_resident_before = false;
     size_t io_slot = 0;

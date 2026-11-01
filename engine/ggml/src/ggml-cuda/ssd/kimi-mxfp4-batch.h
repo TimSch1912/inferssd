@@ -29,6 +29,15 @@ struct kimi_mxfp4_batch_api {
 };
 
 const struct kimi_mxfp4_batch_api * kimi_mxfp4_batch_get_api(void);
+struct kimi_mxfp4_decode_expert {
+    const void * up, * gate, * down;
+    int first, count, tokens[5]; // compact output rows, input-token indices
+};
+int kimi_mxfp4_batch_decode_many(struct kimi_mxfp4_batch *, const struct kimi_mxfp4_decode_expert *, int experts,
+    const void * input, int tokens, int routes, float limit, float * output, char * error, size_t size);
+// Small decode only: preserve the vector engine's MXFP4 summation order.
+int kimi_mxfp4_batch_decode(struct kimi_mxfp4_batch *, const void * up, const void * gate, const void * down,
+    const void * input, int tokens, float limit, float * output, char * error, size_t size);
 
 #ifdef __cplusplus
 }

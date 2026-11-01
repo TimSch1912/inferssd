@@ -67,12 +67,13 @@ int main(int argc, char ** argv) {
                     for (int keep=1;keep<=batch_size;++keep) {
                         std::vector<llama_token> probe{text[(n+7)%text.size()]};
                         auto replay = [&] {
-                            for (int i=0;i<keep;++i) { std::vector<llama_token> one{inputs[i]};decode(one,n+i); }
+                            std::vector<llama_token> prefix(inputs.begin(),inputs.begin()+keep);
+                            decode(prefix,n);
                             decode(probe,n+keep);return logits();
                         };
-                        auto sequential = [&] { restore();return replay(); };
+                        auto fresh_prefix = [&] { restore();return replay(); };
                         auto & saved=references[keep];
-                        if (saved.first.empty()) { saved.first=sequential();saved.second=sequential(); }
+                        if (saved.first.empty()) { saved.first=fresh_prefix();saved.second=fresh_prefix(); }
                         const auto clean=difference(saved.first,saved.second);
                         restore();decode(verifier,n);restore();
                         const auto dirty_control=replay();

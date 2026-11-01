@@ -35,3 +35,10 @@ inline void llama_dspark_act_quant32(const float * input, float * output) {
         output[i] = llama_dsv41_engram_bf16_round(std::copysign(levels[code]*scale,values[i]));
     }
 }
+
+// The head score is a gating heuristic, not a calibrated acceptance probability.
+inline int llama_dspark_confident_prefix(const float * scores, int count, float cutoff) {
+    int kept = 1;
+    while (kept < count && scores[kept] >= cutoff) { ++kept; }
+    return kept;
+}

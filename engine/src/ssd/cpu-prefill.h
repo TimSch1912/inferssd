@@ -8,6 +8,7 @@ struct llama_kimi_cpu_prefill_runtime {
     kimi_cpu_prefill * context = nullptr;
     decltype(&kimi_cpu_prefill_run) run = nullptr;
     decltype(&kimi_cpu_prefill_run_activation) run_activation = nullptr;
+    decltype(&kimi_cpu_decode_run_activation) decode_run_activation = nullptr;
     decltype(&kimi_cpu_prefill_destroy) destroy = nullptr;
 
     void reset() {
@@ -30,6 +31,7 @@ struct llama_kimi_cpu_prefill_runtime {
         const auto create = api->prefill_create;
         run = api->prefill_run;
         run_activation = api->prefill_run_activation;
+        decode_run_activation = api->decode_run_activation;
         destroy = api->prefill_destroy;
         char error[512] = {};
         context = create(sink, error, sizeof(error));

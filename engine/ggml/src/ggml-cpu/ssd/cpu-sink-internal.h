@@ -64,6 +64,9 @@ struct kimi_cpu_sink_prefill_batch {
     uint64_t ssd_experts;
     uint64_t ssd_routes;
     uint64_t ssd_bytes;
+    float * routed_output;
+    uint8_t * consumed;
+    bool decode; // grouped 2..5-token decode: keep/train caches, no prefill lifecycle
 };
 
 void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,

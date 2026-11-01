@@ -82,6 +82,74 @@ __global__ void batch_rows_warp(const char * up, const char * gate, const char *
     }
 }
 
+// Coalesced blocks and integer dp4a, but the original vector kernel's FP sum
+// order: lane 0 adds the terms in increasing block index. Every weight block
+// is unpacked once for all routed columns, across all resident experts.
+__global__ void batch_rows_decode(const kimi_mxfp4_decode_expert * jobs,
+        const block_q8_0 * input, int columns, int rows, float * output, bool first_stage) {
+    const int row=blockIdx.x*4+threadIdx.x/32, lane=threadIdx.x%32;
+    if (row>=rows) { return; }
+    const kimi_mxfp4_decode_expert job=jobs[blockIdx.z];
+    const int role=first_stage ? blockIdx.y : 0;
+    const void * weights=first_stage ? (role ? job.gate : job.up) : job.down;
+    const int blocks=columns/QK_MXFP4;
+    const auto * x=static_cast<const block_mxfp4 *>(weights)+size_t(row)*blocks;
+    float sums[5]={};
+    for (int first=0; first<blocks; first+=32) {
+        const int ib=first+lane;
+        float terms[5]={};
+        if (ib<blocks) {
+            const block_mxfp4 w=x[ib];
+            const float scale=fp4_scale(w.e);
+            int packed[8];
+#pragma unroll
+            for (int j=0; j<8; ++j) {
+                uint32_t word=0;
+#pragma unroll
+                for (int k=0; k<4; ++k) {
+                    const int q=4*j+k;
+                    const int value=q<16 ? fp4_value(w.qs[q]&15) : fp4_value(w.qs[q-16]>>4);
+                    word|=uint32_t(uint8_t(value))<<(8*k);
+                }
+                packed[j]=int(word);
+            }
+#pragma unroll
+            for (int t=0; t<5; ++t) {
+                if (t<job.count) {
+                    const int source=first_stage ? job.tokens[t] : job.first+t;
+                    const block_q8_0 y=input[size_t(source)*blocks+ib];
+                    int dot=0;
+#pragma unroll
+                    for (int j=0; j<8; ++j) {
+                        const int k=4*j;
+                        const uint32_t q=uint32_t(uint8_t(y.qs[k])) | (uint32_t(uint8_t(y.qs[k+1]))<<8) |
+                            (uint32_t(uint8_t(y.qs[k+2]))<<16) | (uint32_t(uint8_t(y.qs[k+3]))<<24);
+                        dot=__dp4a(packed[j],int(q),dot);
+                    }
+                    terms[t]=(__half2float(y.d)*scale)*float(dot);
+                }
+            }
+        }
+        for (int j=0; j<32 && first+j<blocks; ++j) {
+#pragma unroll
+            for (int t=0; t<5; ++t) {
+                if (t<job.count) {
+                    const float term=__shfl_sync(0xffffffff,terms[t],j);
+                    if (lane==0) { sums[t]+=term; }
+                }
+            }
+        }
+    }
+    if (lane==0) {
+#pragma unroll
+        for (int t=0; t<5; ++t) {
+            if (t<job.count) {
+                output[(first_stage ? size_t(2*(job.first+t)+role) : size_t(job.first+t))*rows+row]=sums[t];
+            }
+        }
+    }
+}
+
 __global__ void activate(const float * up_gate, float * hidden, int tokens, int rows, float limit) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= tokens * rows) return;
@@ -446,3 +514,73 @@ const kimi_mxfp4_batch_api batch_api = {3, sizeof(kimi_mxfp4_batch_api),
 
 extern "C" __attribute__((visibility("default")))
 const kimi_mxfp4_batch_api * kimi_mxfp4_batch_get_api() { return &batch_api; }
+
+extern "C" int kimi_mxfp4_batch_decode_many(kimi_mxfp4_batch * batch, const kimi_mxfp4_decode_expert * jobs, int experts,
+        const void * input, int tokens, int routes, float limit, float * output, char * error, size_t size) {
+    if (!batch || !jobs || !input || !output || tokens<1 || tokens>5 || experts<1 || experts>80 ||
+            routes<1 || routes>80 || routes>batch->capacity || !std::isfinite(limit) || limit<=0) {
+        if (error && size) std::snprintf(error,size,"invalid MXFP4 decode union");
+        return 0;
+    }
+    int end=0;
+    for (int i=0; i<experts; ++i) {
+        const auto & job=jobs[i];
+        if (!job.up || !job.gate || !job.down || job.first!=end || job.count<1 || job.count>5) {
+            if (error && size) std::snprintf(error,size,"invalid MXFP4 decode expert descriptor");
+            return 0;
+        }
+        for (int t=0; t<job.count; ++t) {
+            if (job.tokens[t]<0 || job.tokens[t]>=tokens) {
+                if (error && size) std::snprintf(error,size,"invalid MXFP4 decode input row");
+                return 0;
+            }
+        }
+        end+=job.count;
+    }
+    const size_t bytes=size_t(tokens)*batch->input_bytes/batch->capacity;
+    const size_t offset=(bytes+7)&~size_t(7), upload=offset+size_t(experts)*sizeof(*jobs);
+    if (end!=routes || upload>batch->input_bytes) {
+        if (error && size) std::snprintf(error,size,"MXFP4 decode staging capacity");
+        return 0;
+    }
+    int previous=-1;
+    cudaGetDevice(&previous);
+    cudaError_t rc=cudaSetDevice(batch->device);
+    std::memcpy(batch->host_input,input,bytes);
+    std::memcpy(batch->host_input+offset,jobs,size_t(experts)*sizeof(*jobs));
+    const auto * descriptors=reinterpret_cast<const kimi_mxfp4_decode_expert *>(batch->device_input+offset);
+    if (rc==cudaSuccess) rc=cudaMemcpyAsync(batch->device_input,batch->host_input,upload,cudaMemcpyHostToDevice,batch->stream);
+    if (rc==cudaSuccess) {
+        batch_rows_decode<<<dim3((batch->hidden+3)/4,2,experts),128,0,batch->stream>>>(descriptors,
+            reinterpret_cast<const block_q8_0 *>(batch->device_input),batch->latent,batch->hidden,batch->up_gate,true);
+        rc=cudaGetLastError();
+    }
+    if (rc==cudaSuccess) {
+        activate<<<(routes*batch->hidden+255)/256,256,0,batch->stream>>>(batch->up_gate,batch->hidden_float,routes,batch->hidden,limit);
+        rc=cudaGetLastError();
+    }
+    if (rc==cudaSuccess) {
+        quantize<<<routes*batch->hidden/QK8_0,QK8_0,0,batch->stream>>>(batch->hidden_float,batch->hidden_q8);
+        rc=cudaGetLastError();
+    }
+    if (rc==cudaSuccess) {
+        batch_rows_decode<<<dim3((batch->latent+3)/4,1,experts),128,0,batch->stream>>>(descriptors,
+            batch->hidden_q8,batch->hidden,batch->latent,batch->device_output,false);
+        rc=cudaGetLastError();
+    }
+    const size_t out_bytes=size_t(routes)*batch->latent*sizeof(float);
+    if (rc==cudaSuccess) rc=cudaMemcpyAsync(batch->host_output,batch->device_output,out_bytes,cudaMemcpyDeviceToHost,batch->stream);
+    // Drain even a failed launch before returning the borrowed weights.
+    const auto drained=cudaStreamSynchronize(batch->stream);
+    if (rc==cudaSuccess) rc=drained;
+    if (rc==cudaSuccess) { std::memcpy(output,batch->host_output,out_bytes);batch->h2d+=upload;batch->d2h+=out_bytes; }
+    else message(error,size,"decode union",rc);
+    if (previous>=0 && previous!=batch->device) cudaSetDevice(previous);
+    return rc==cudaSuccess;
+}
+
+extern "C" int kimi_mxfp4_batch_decode(kimi_mxfp4_batch * batch, const void * up, const void * gate, const void * down,
+        const void * input, int tokens, float limit, float * output, char * error, size_t size) {
+    kimi_mxfp4_decode_expert job={up,gate,down,0,tokens,{0,1,2,3,4}};
+    return kimi_mxfp4_batch_decode_many(batch,&job,1,input,tokens,tokens,limit,output,error,size);
+}

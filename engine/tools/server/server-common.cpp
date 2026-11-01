@@ -1548,7 +1548,7 @@ json format_response_rerank(
 // other utils
 //
 
-std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx) {
+std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t top_n) {
     std::vector<llama_token_data> cur;
 
     const auto * logits = llama_get_logits_ith(ctx, idx);
@@ -1567,10 +1567,14 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
         }
     }
 
-    // sort tokens by logits
-    std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
-    });
+    // Fast verifier only needs the top few raw probabilities. Keep all logits
+    // in the softmax denominator; sampling has already used the normal target sampler.
+    const auto by_logit = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+    if (top_n && top_n < cur.size()) {
+        std::partial_sort(cur.begin(), cur.begin()+top_n, cur.end(), by_logit);
+    } else {
+        std::sort(cur.begin(), cur.end(), by_logit);
+    }
 
     // apply softmax
     float max_l = cur[0].logit;

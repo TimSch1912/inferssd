@@ -1105,6 +1105,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_dspark_confidence = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1637,7 +1638,6 @@ llama_expert_gating_func_type gating_op,
     if (!cpu_sink_runtime || (n_tokens != 1 && !(arch == LLM_ARCH_DEEPSEEK41 && cpu_sink_decode && n_tokens <= 5)) || !next_norm || !next_gate_inp) {
         return nullptr;
     }
-    if (n_tokens > 1) { ffn_inp = ggml_view_2d(ctx0,ffn_inp,ffn_inp->ne[0],1,ffn_inp->nb[1],0); }
     ggml_tensor * x = build_norm(ffn_inp, next_norm, nullptr, LLM_NORM_RMS, il);
     ggml_tensor * logits = build_lora_mm(next_gate_inp, x);
     ggml_prec_set_acc(logits, GGML_PREC_F32);

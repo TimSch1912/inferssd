@@ -446,6 +446,9 @@ extern "C" {
     // Draft up to four tokens from committed features, each 3*n_embd floats.
     LLAMA_API int32_t llama_dspark_draft_n(struct llama_context * ctx, const float * features,
         const llama_pos * positions, int32_t n_context, llama_token known, llama_token * drafts, int32_t k);
+    // Optional confidence gating; sigmoid cutoff in 0..1, at least one draft.
+    LLAMA_API int32_t llama_dspark_draft_gated(struct llama_context * ctx, const float * features,
+        const llama_pos * positions, int32_t n_context, llama_token known, llama_token * drafts, int32_t k, float confidence);
     // Single-stream DSv4 append transaction, at most five inputs in one ubatch.
     LLAMA_API bool llama_dspark_undo_begin(struct llama_context * ctx);
     LLAMA_API bool llama_dspark_undo_end(struct llama_context * ctx, bool restore);

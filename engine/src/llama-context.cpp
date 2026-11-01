@@ -12,6 +12,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-dspark.h"
+#include "llama-dspark-quant.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-ext.h"
 #include "llama.h"
@@ -4823,7 +4824,7 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
     return ctx->memory_breakdown();
 }
 
-int32_t llama_context::dspark_draft(const float * features, const llama_pos * positions, int32_t count, llama_token known, llama_token * drafts, int32_t k) {
+int32_t llama_context::dspark_draft(const float * features, const llama_pos * positions, int32_t count, llama_token known, llama_token * drafts, int32_t k, float confidence) {
     if (!model.dspark || !features || !positions || count < 1 || count > 128 ||
         !drafts || k < 1 || k > 4 || known < 0 || known >= model.vocab.n_tokens() || !cpu_sink_runtime || !loras->empty()) {
         return 0;
@@ -4846,7 +4847,7 @@ int32_t llama_context::dspark_draft(const float * features, const llama_pos * po
     ub.n_tokens = ub.n_seq_tokens = 5; ub.n_seqs = ub.n_seqs_unq = ub.n_pos = ub.b_equal_seqs = 1;
     ub.token = tokens; ub.pos = pos; ub.n_seq_id = ns; ub.seq_id = ids;
     ub.seq_id_unq = &seq; ub.seq_idx = seq_idx; ub.output = output;
-    llama_dspark_input input{features, positions, count, known, k};
+    llama_dspark_input input{features, positions, count, known, k, confidence > 0.0f};
     auto gp = graph_params(res, ub, nullptr, LLM_GRAPH_TYPE_DECODER);
     gp.cpu_sink_prefill = true; gp.cpu_sink_decode = true; gp.n_outputs = k; gp.samplers.clear(); gp.dspark = &input;
     const int64_t t_build = ggml_time_us();
@@ -4872,6 +4873,18 @@ int32_t llama_context::dspark_draft(const float * features, const llama_pos * po
     }
     LLAMA_LOG_INFO("DSpark draft profile: k=%d build_ms=%.3f alloc_ms=%.3f compute_read_ms=%.3f\n",
         k,(t_alloc-t_build)/1e3,(t_compute-t_alloc)/1e3,(ggml_time_us()-t_compute)/1e3);
+    if (confidence > 0.0f) {
+        float scores[4] = {};
+        if (!res->t_dspark_confidence) { throw std::runtime_error("missing DSpark confidence output"); }
+        ggml_backend_tensor_get(res->t_dspark_confidence, scores, 0, k*sizeof(float));
+        for (int i=0; i<k; ++i) {
+            if (!std::isfinite(scores[i]) || scores[i]<0 || scores[i]>1) { throw std::runtime_error("invalid DSpark confidence"); }
+        }
+        const int kept=llama_dspark_confident_prefix(scores,k,confidence);
+        LLAMA_LOG_INFO("DSpark confidence: requested=%d kept=%d cutoff=%.3f scores=%.4f,%.4f,%.4f,%.4f\n",
+            k,kept,confidence,scores[0],scores[1],scores[2],scores[3]);
+        return kept;
+    }
     return k;
 }
 
@@ -4879,6 +4892,13 @@ int32_t llama_dspark_draft_n(llama_context * ctx, const float * features, const 
         int32_t count, llama_token known, llama_token * drafts, int32_t k) {
     try { return ctx->dspark_draft(features, positions, count, known, drafts, k); }
     catch (const std::exception & e) { LLAMA_LOG_ERROR("DSpark draft failed: %s\n", e.what()); return 0; }
+}
+
+int32_t llama_dspark_draft_gated(llama_context * ctx, const float * features, const llama_pos * positions,
+        int32_t count, llama_token known, llama_token * drafts, int32_t k, float confidence) {
+    if (!std::isfinite(confidence) || confidence < 0.0f || confidence > 1.0f) { return 0; }
+    try { return ctx->dspark_draft(features,positions,count,known,drafts,k,confidence); }
+    catch (const std::exception & e) { LLAMA_LOG_ERROR("DSpark gated draft failed: %s\n",e.what());return 0; }
 }
 
 llama_token llama_dspark_draft(llama_context * ctx, const float * features, const llama_pos * positions,
