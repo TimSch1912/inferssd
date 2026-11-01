@@ -1175,6 +1175,7 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             return nullptr;
         }
 
+        if (undo) { capture_undo(ubatches, sinfos_raw_base_write, sinfos_raw_swa_write); }
         auto sinfos_raw_swa_read = dsv4_build_raw_read_sinfos(sinfos_raw_swa_write, ubatches);
 
         return std::make_unique<llama_kv_cache_dsv4_context>(
@@ -1273,6 +1274,7 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
 }
 
 void llama_kv_cache_dsv4::clear(bool data) {
+    undo.reset();
     kv_raw->clear(data);
     clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
 }
@@ -2033,4 +2035,86 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
             lid_state->get_n_stream(), lid_state->get_n_rs_seq());
 
     return reserve_plan_lid;
+}
+
+// ponytail: one bounded verifier transaction; reject restores it and replays the committed prefix.
+// Addresses come from the actual raw allocator and compressor plans, including dummy writes.
+bool llama_kv_cache_dsv4::undo_begin() {
+    if (undo || n_seq_max != 1 || n_rs_seq != 0) { return false; }
+    undo = std::make_unique<undo_state>();
+    undo->rs_idx = rs_idx;
+    return true;
+}
+
+size_t llama_kv_cache_dsv4::undo_bytes() const {
+    size_t n = 0;
+    if (undo) { for (const auto & row : undo->rows) { n += row.data.size(); } }
+    return n;
+}
+
+bool llama_kv_cache_dsv4::undo_end(bool restore) {
+    if (!undo) { return false; }
+    bool ok = !restore || undo->captured;
+    if (restore && undo->captured) {
+        for (const auto & row : undo->rows) {
+            ggml_backend_tensor_set(row.tensor,row.data.data(),row.offset,row.data.size());
+        }
+        for (auto & item : undo->metadata) { ok = item.first->restore_ubatch_metadata(*item.second) && ok; }
+        rs_idx = undo->rs_idx;
+    }
+    undo.reset();
+    return ok;
+}
+
+void llama_kv_cache_dsv4::capture_undo(const std::vector<llama_ubatch> & ubatches,
+        const llama_kv_cache::slot_info_vec_t & base, const llama_kv_cache::slot_info_vec_t & swa) {
+    if (undo->captured || ubatches.size() != 1 || ubatches[0].n_tokens > 5 ||
+            ubatches[0].n_seqs_unq != 1 || dsv4_ubatch_has_coupled(ubatches[0])) {
+        throw std::runtime_error("DSpark undo invalid batch: captured="+std::to_string(undo->captured)+
+            " ubatches="+std::to_string(ubatches.size())+" tokens="+std::to_string(ubatches.empty()?0:ubatches[0].n_tokens)+
+            " sequences="+std::to_string(ubatches.empty()?0:ubatches[0].n_seqs_unq));
+    }
+    const int64_t t_start = ggml_time_us();
+    auto save_rows = [&](ggml_tensor * tensor, const auto & indices) {
+        std::vector<int64_t> rows(indices.begin(),indices.end());
+        std::sort(rows.begin(),rows.end()); rows.erase(std::unique(rows.begin(),rows.end()),rows.end());
+        for (size_t i = 0; i < rows.size();) {
+            size_t end = i+1;
+            while (end < rows.size() && rows[end] == rows[end-1]+1) { ++end; }
+            const size_t offset = rows[i]*tensor->nb[1], bytes = (end-i)*tensor->nb[1];
+            if (rows[i] < 0 || offset > ggml_nbytes(tensor) || bytes > ggml_nbytes(tensor)-offset) {
+                throw std::runtime_error("DSpark undo row outside tensor");
+            }
+            undo_row saved{tensor,offset,std::vector<uint8_t>(bytes)};
+            ggml_backend_tensor_get(tensor,saved.data.data(),offset,bytes);
+            undo->rows.push_back(std::move(saved));
+            i = end;
+        }
+    };
+    auto save_raw = [&](llama_kv_cache * cache, const llama_kv_cache::slot_info & sinfo) {
+        undo->metadata.emplace_back(cache,cache->save_ubatch_metadata(sinfo));
+        for (auto il : cache->get_layer_ids()) { save_rows(cache->get_k_storage(il),sinfo.idxs.at(0)); }
+    };
+    save_raw(kv_raw->get_base(),base.at(0));
+    save_raw(kv_raw->get_swa(),swa.at(0));
+    auto save_comp = [&](llama_kv_cache * cache, llama_dsv4_comp_state * state) {
+        const auto plan = dsv4_build_comp_plan(ubatches[0],state->get_ratio(),state->get_overlap(),
+            state->get_state_size(),cache->get_size(),state->get_n_stream(),n_rs_seq,rs_idx);
+        for (auto il : cache->get_layer_ids()) {
+            // V4.1 stores both ratio streams in CSA, and uses that same plan for index keys.
+            auto * source = hparams_raw.dsv4_compress_ratios[il] == hca_state->get_ratio() ? hca_state.get() : csa_state.get();
+            const auto writes = dsv4_build_comp_plan(ubatches[0],source->get_ratio(),source->get_overlap(),
+                source->get_state_size(),cache->get_size(),source->get_n_stream(),n_rs_seq,rs_idx);
+            save_rows(cache->get_k_storage(il),writes.state_write_idxs);
+        }
+        for (const auto & layer : state->layers) {
+            save_rows(layer.kv,plan.state_persist_dst_idxs);
+            save_rows(layer.score,plan.state_persist_dst_idxs);
+        }
+    };
+    save_comp(kv_csa.get(),csa_state.get());
+    save_comp(kv_hca.get(),hca_state.get());
+    save_comp(kv_lid.get(),lid_state.get());
+    undo->captured = true;
+    LLAMA_LOG_INFO("DSpark undo profile: bytes=%zu spans=%zu capture_ms=%.3f\n",undo_bytes(),undo->rows.size(),(ggml_time_us()-t_start)/1e3);
 }

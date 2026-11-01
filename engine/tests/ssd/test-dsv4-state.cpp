@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-model.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -108,6 +109,61 @@ static void check(bool v41, int n, llama_state_seq_flags flags) {
         require(actual == s.values);
     }
     writer after; kv.state_write(after, 0, flags); require(after.bytes == before.bytes);
+    if (v41 && flags == LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT) {
+        for (int k = 1; k <= 4; ++k) {
+            std::vector<ggml_tensor *> tensors;
+            for (auto * cache : {kv.get_raw()->get_base(),kv.get_raw()->get_swa(),kv.get_csa(),kv.get_hca(),kv.get_lid()}) {
+                for (auto il : cache->get_layer_ids()) { tensors.push_back(cache->get_k_storage(il)); }
+            }
+            for (const auto & item : saved) { tensors.push_back(item.tensor); }
+            std::vector<std::vector<uint8_t>> original;
+            for (auto * t : tensors) {
+                original.emplace_back(ggml_nbytes(t));
+                ggml_backend_tensor_get(t,original.back().data(),0,original.back().size());
+            }
+            std::vector<llama_pos> positions(k+1);
+            for (int i=0;i<=k;++i) { positions[i]=n+i; }
+            llama_batch append = {k+1,nullptr,embd.data(),positions.data(),ns.data(),ids.data(),outputs.data()};
+            // The tiny n=1 fixture still needs k+1 backing rows.
+            std::vector<float> append_embd(4*(k+1)); std::vector<int32_t> append_ns(k+1,1);
+            std::vector<llama_seq_id *> append_ids(k+1,&seq); std::vector<int8_t> append_out(k+1,0);
+            append.embd=append_embd.data(); append.n_seq_id=append_ns.data(); append.seq_id=append_ids.data(); append.logits=append_out.data();
+            require(kv.undo_begin()); require(!kv.undo_begin());
+            require(alloc.init(append,vocab,&kv,4,1,false));
+            auto delta = kv.init_batch(alloc,512,false);
+            require(delta->get_status()==LLAMA_MEMORY_STATUS_SUCCESS); require(delta->apply());
+            auto * plan = dynamic_cast<llama_kv_cache_dsv4_context *>(delta.get()); require(plan);
+            auto poison = [](ggml_tensor * t, const auto & rows) {
+                for (auto row : rows) { ggml_backend_tensor_memset(t,0x5a,row*t->nb[1],t->nb[1]); }
+            };
+            for (auto * cache : {kv.get_raw()->get_base(),kv.get_raw()->get_swa()}) {
+                const auto & cells=cache->get_cells(0); std::vector<uint32_t> rows;
+                for (uint32_t i=0;i<cache->get_size();++i) { if (cells.pos_get(i)>=n && cells.pos_get(i)<=n+k) { rows.push_back(i); } }
+                for (auto il:cache->get_layer_ids()) { poison(cache->get_k_storage(il),rows); }
+            }
+            for (auto * cache : {kv.get_csa(),kv.get_lid()}) {
+                for (auto il:cache->get_layer_ids()) {
+                    const auto & writes=hp.dsv4_compress_ratios[il]==kv.get_csa_state()->get_ratio() ? plan->get_csa_plan() : plan->get_hca_plan();
+                    poison(cache->get_k_storage(il),writes.state_write_idxs);
+                }
+            }
+            for (const auto & item:saved) {
+                if (!std::strstr(item.tensor->name,"state_")) { continue; }
+                for (int l=0;l<2;++l) {
+                    if (std::strstr(item.tensor->name,("_l"+std::to_string(l)).c_str())) {
+                        const auto & writes=hp.dsv4_compress_ratios[l]==kv.get_csa_state()->get_ratio() ? plan->get_csa_plan() : plan->get_hca_plan();
+                        poison(item.tensor,writes.state_persist_dst_idxs);
+                    }
+                }
+            }
+            require(kv.undo_bytes()<1024*1024); require(kv.undo_end(true)); require(!kv.undo_end(true));
+            for (size_t i=0;i<tensors.size();++i) {
+                std::vector<uint8_t> actual(original[i].size()); ggml_backend_tensor_get(tensors[i],actual.data(),0,actual.size());
+                require(actual==original[i]);
+            }
+            writer restored; kv.state_write(restored,0,flags); require(restored.bytes==before.bytes);
+        }
+    }
     std::printf("DSv4 state roundtrip ratios=%s tokens=%d flags=%u bytes=%zu OK\n", v41 ? "2/1" : "4/128", n, flags, before.bytes.size());
 }
 int main() {

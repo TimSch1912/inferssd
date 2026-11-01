@@ -62,6 +62,7 @@ public:
     ggml_tensor * cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
 
 private:
+    friend class llama_kv_cache_dsv4;
     struct layer {
         uint32_t il;
 
@@ -184,11 +185,25 @@ public:
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
 
+    bool undo_begin();
+    bool undo_end(bool restore);
+    size_t undo_bytes() const;
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
 private:
+    struct undo_row { ggml_tensor * tensor; size_t offset; std::vector<uint8_t> data; };
+    struct undo_state {
+        bool captured = false;
+        std::vector<undo_row> rows;
+        std::vector<std::pair<llama_kv_cache *, std::unique_ptr<llama_kv_cache::metadata_undo>>> metadata;
+        std::vector<uint32_t> rs_idx;
+    };
+    std::unique_ptr<undo_state> undo;
+    void capture_undo(const std::vector<llama_ubatch> & ubatches,
+        const llama_kv_cache::slot_info_vec_t & base, const llama_kv_cache::slot_info_vec_t & swa);
+
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
     llama_hparams hparams_hca;
