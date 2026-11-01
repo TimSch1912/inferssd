@@ -52,52 +52,86 @@ int main(int argc, char ** argv) {
                 std::vector<llama_token> inputs = {known[0]};
                 for (int i = 1; i < 5; ++i) { inputs.push_back(text[(n+i)%text.size()]); }
                 std::map<int,std::pair<std::vector<float>,std::vector<float>>> references;
-                // k=1..4, every retained prefix, including full acceptance.
-                for (int batch_size = 2; batch_size <= 5; ++batch_size) {
-                for (int keep = 1; keep <= batch_size; ++keep) {
-                    auto sequential = [&] {
-                        restore();
-                        for (int i = 0; i < keep; ++i) { std::vector<llama_token> one{inputs[i]}; decode(one,n+i); }
-                        std::vector<llama_token> probe{text[(n+7)%text.size()]}; decode(probe,n+keep);
-                        return logits();
-                    };
-                    auto & saved = references[keep];
-                    if (saved.first.empty()) { saved.first=sequential();saved.second=sequential(); }
-                    const auto & reference=saved.first; const auto & control=saved.second;
-                    restore();
-                    require(llama_dspark_undo_begin(ctx),"undo begin failed");
-                    std::vector<llama_token> verifier(inputs.begin(),inputs.begin()+batch_size);
-                    decode(verifier,n);
-                    require(llama_dspark_undo_end(ctx,keep != batch_size),"undo end failed");
-                    if (keep != batch_size) {
-                        for (int i=0;i<keep;++i) { std::vector<llama_token> one{inputs[i]}; decode(one,n+i); }
-                    }
-                    std::vector<llama_token> probe{text[(n+7)%text.size()]}; decode(probe,n+keep);
-                    const auto actual = logits();
-                    double mean=0, control_mean=0; float maximum=0, control_max=0;
+                auto difference = [&](const std::vector<float> & x, const std::vector<float> & y) {
+                    double mean=0; float maximum=0;
                     for (int i=0;i<width;++i) {
-                        const auto d=std::abs(reference[i]-actual[i]), c=std::abs(reference[i]-control[i]);
-                        require(std::isfinite(actual[i]),"nonfinite canary logit");
-                        mean+=d; control_mean+=c; maximum=std::max(maximum,d); control_max=std::max(control_max,c);
+                        require(std::isfinite(x[i]) && std::isfinite(y[i]),"nonfinite canary logit");
+                        const auto d=std::abs(x[i]-y[i]);mean+=d;maximum=std::max(maximum,d);
                     }
-                    mean/=width; control_mean/=width;
-                    std::printf("MODEL_UNDO tokens=%d batch=%d keep=%d max_delta=%.9g mean_delta=%.9g control_max=%.9g control_mean=%.9g\n",
-                        n,batch_size,keep,maximum,mean,control_max,control_mean); std::fflush(stdout);
-                    // Mixed-tier placement changes arithmetic. Bound both average drift and outliers;
-                    // retain the independently repeated sequential control alongside every comparison.
-                    if (keep != batch_size) {
-                        require(mean < 0.02 && maximum < 0.25,"undo continuation outside normal numerical tolerance");
-                    } else {
-                        // No undo on full acceptance. Isolate ordinary multi-token arithmetic from undo:
-                        // compare the committed batch with a fresh batch using exactly the same inputs.
-                        restore(); decode(verifier,n); decode(probe,n+keep); const auto fresh=logits();
-                        double gap=0; float worst=0;
-                        for (int i=0;i<width;++i) { const auto d=std::abs(fresh[i]-actual[i]);gap+=d;worst=std::max(worst,d); }
-                        gap/=width;
-                        printf("MODEL_FULL_ACCEPT tokens=%d batch=%d fresh_max=%.9g fresh_mean=%.9g\n",n,batch_size,worst,gap);fflush(stdout);
-                        require(gap < 0.02 && worst < 0.25,"full-accept state differs from fresh batch");
+                    return std::make_pair(mean/width,maximum);
+                };
+                // k=1..4, every retained prefix. The independent full-restore control
+                // touches the same future experts, separating tier arithmetic from KV damage.
+                for (int batch_size=2;batch_size<=5;++batch_size) {
+                    std::vector<llama_token> verifier(inputs.begin(),inputs.begin()+batch_size);
+                    for (int keep=1;keep<=batch_size;++keep) {
+                        std::vector<llama_token> probe{text[(n+7)%text.size()]};
+                        auto replay = [&] {
+                            for (int i=0;i<keep;++i) { std::vector<llama_token> one{inputs[i]};decode(one,n+i); }
+                            decode(probe,n+keep);return logits();
+                        };
+                        auto sequential = [&] { restore();return replay(); };
+                        auto & saved=references[keep];
+                        if (saved.first.empty()) { saved.first=sequential();saved.second=sequential(); }
+                        const auto clean=difference(saved.first,saved.second);
+                        restore();decode(verifier,n);restore();
+                        const auto dirty_control=replay();
+                        const auto dirty=difference(saved.first,dirty_control);
+                        const double control_mean=std::max(clean.first,dirty.first);
+                        const float control_max=std::max(clean.second,dirty.second);
+                        const double mean_limit=std::max(0.02,3*control_mean);
+                        const float max_limit=std::max(0.25f,3*control_max);
+                        std::vector<float> full_reference;
+                        std::pair<double,float> full_variance{0,0};
+                        if (keep==batch_size) {
+                            // Independent fresh batches span cold-to-warm expert admission before
+                            // testing Full Accept. They do not use the bounded-undo implementation.
+                            for (int repeat=0;repeat<4;++repeat) {
+                                restore();decode(verifier,n);decode(probe,n+keep);auto fresh=logits();
+                                if (full_reference.empty()) { full_reference=std::move(fresh); }
+                                else {
+                                    const auto d=difference(full_reference,fresh);
+                                    full_variance.first=std::max(full_variance.first,d.first);
+                                    full_variance.second=std::max(full_variance.second,d.second);
+                                }
+                            }
+                        }
+                        auto snapshot = [&] {
+                            std::vector<uint8_t> bytes(llama_state_seq_get_size_ext(ctx,0,flags));
+                            require(llama_state_seq_get_data_ext(ctx,bytes.data(),bytes.size(),0,flags)==bytes.size(),"cache snapshot failed");
+                            return bytes;
+                        };
+                        restore();
+                        require(llama_dspark_undo_begin(ctx),"undo begin failed");
+                        decode(verifier,n);
+                        const auto full_before=keep==batch_size ? snapshot() : std::vector<uint8_t>{};
+                        require(llama_dspark_undo_end(ctx,keep!=batch_size),"undo end failed");
+                        if (keep==batch_size) {
+                            require(snapshot()==full_before,"Full Accept mutated cache on discard");
+                            printf("MODEL_FULL_BYTES tokens=%d batch=%d exact=1 bytes=%zu\n",n,batch_size,full_before.size());fflush(stdout);
+                        }
+                        if (keep!=batch_size) {
+                            // Test-only full serialization: production Fast never snapshots the sequence.
+                            std::vector<uint8_t> restored(state.size());
+                            require(llama_state_seq_get_data_ext(ctx,restored.data(),restored.size(),0,flags)==state.size(),"undo state size changed");
+                            require(restored==state,"delta undo did not restore exact cache bytes");
+                            printf("MODEL_CACHE_BYTES tokens=%d batch=%d keep=%d exact=1 bytes=%zu\n",n,batch_size,keep,state.size());fflush(stdout);
+                        }
+                        const auto actual=keep!=batch_size ? replay() : (decode(probe,n+keep),logits());
+                        const auto gap=difference(saved.first,actual);
+                        printf("MODEL_UNDO tokens=%d batch=%d keep=%d max_delta=%.9g mean_delta=%.9g control_max=%.9g control_mean=%.9g mean_limit=%.9g max_limit=%.9g\n",
+                            n,batch_size,keep,gap.second,gap.first,control_max,control_mean,mean_limit,max_limit);fflush(stdout);
+                        if (keep!=batch_size) {
+                            require(gap.first<=mean_limit && gap.second<=max_limit,"undo continuation outside measured control envelope");
+                        } else {
+                            const auto actual_gap=difference(actual,full_reference);
+                            const double full_mean_limit=std::max(0.02,3*full_variance.first);
+                            const float full_max_limit=std::max(0.25f,3*full_variance.second);
+                            printf("MODEL_FULL_ACCEPT tokens=%d batch=%d fresh_max=%.9g fresh_mean=%.9g control_max=%.9g control_mean=%.9g mean_limit=%.9g max_limit=%.9g\n",
+                                n,batch_size,actual_gap.second,actual_gap.first,full_variance.second,full_variance.first,full_mean_limit,full_max_limit);fflush(stdout);
+                            require(actual_gap.first<=full_mean_limit && actual_gap.second<=full_max_limit,"full accept differs beyond measured control envelope");
+                        }
                     }
-                }
                 }
                 continue;
             }

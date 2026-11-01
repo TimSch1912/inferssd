@@ -3616,7 +3616,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (v != "fast" && v != "strict") { throw std::invalid_argument("mtp-mode must be fast or strict"); }
             p.speculative.mtp_strict = v == "strict";
         }).set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg({"--mtp-drafts"}, "N", "DSpark draft positions, 1..4 (default: 4)",
+    add_opt(common_arg({"--mtp-drafts"}, "N", "DSpark draft positions, 1..4 (default: 1)",
         [](common_params & p, int n) {
             if (n < 1 || n > 4) { throw std::invalid_argument("mtp-drafts must be 1..4"); }
             p.speculative.mtp_drafts = n;
