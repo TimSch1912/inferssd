@@ -727,7 +727,9 @@ struct expert_cache {
         } catch (const std::bad_alloc &) { pause(requests, current, "metadata_allocation_failed"); return; }
         layer & l = *found;
         const size_t layer_index = size_t(found - layers.begin());
-        if (!l.count || (l.seen && l.token == token)) { return; }
+        // A small vector batch may visit a layer repeatedly in one cache step.
+        // count_decay2 admits immutable weights per row; all previous calls have drained.
+        if (!l.count || (l.seen && l.token == token && policy != count_decay2)) { return; }
         // Entries from a skipped token are not a previous-token window.
         const bool previous = l.seen && l.token != UINT64_MAX && l.token + 1 == token;
         for (size_t i = l.begin; i < l.begin + l.count; ++i) {

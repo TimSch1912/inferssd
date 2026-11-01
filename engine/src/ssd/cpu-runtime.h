@@ -87,6 +87,7 @@ struct llama_kimi_cpu_sink_runtime {
     bool sequence_known = false;
     llama_seq_id sequence = 0;
     bool cache_decode_active = false;
+    uint64_t micro_step = 0;
     // A prefill phase is open from a prefill begin() until phase_complete(true) or a decode begin(); the graph
     // reserves inside it repeat the request-boundary transition and are skipped.
     bool prefill_open = false;
@@ -252,11 +253,15 @@ struct llama_kimi_cpu_sink_runtime {
             stats.prefill_hits, stats.prefill_misses, stats.prefill_hit_bytes, stats.prefill_leases);
     }
 
-    void begin(ggml_backend_reg_t registry, uint64_t token, bool decode, llama_seq_id seq = 0) {
+    void begin(ggml_backend_reg_t registry, uint64_t token, bool decode, llama_seq_id seq = 0, bool microbatch = false) {
         std::lock_guard<std::mutex> lock(mutex);
         const bool observe = services.debug && (services.debug->trace || services.debug->profile);
         if (!cache_budget && !vram_budget && !observe) { return; }
         if (decode) { initialize(registry); }
+        // Expert weights are immutable. MTP positions repeat for draft/verify and skip
+        // after full acceptance; the cache requires consecutive execution steps instead.
+        if (decode && microbatch) { token = ++micro_step; }
+        if (!decode) { micro_step = 0; }
         if (!sink || (!decode && prefill_open)) { return; }
         char error[512] = {};
         if (decode && sequence_known && sequence != seq) {
@@ -407,6 +412,9 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
     if (node.small_decode) {
         // ponytail: reuse the tier-aware vector executor for <=5 rows; no prefill transition or SSD-only drafts.
         // Attention and dense operations still run as a single multi-token graph.
+        if (const ggml_tensor * hint=dst->src[5]; hint && runtime.prefetch_hint) {
+            runtime.prefetch_hint(runtime.sink,node.layer+1,static_cast<const int32_t *>(hint->data),int(ggml_nelements(hint)));
+        }
         ok = true;
         for (int i = 0; i < ntokens && ok; ++i) {
             kimi_cpu_sink_stats row = {};

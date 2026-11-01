@@ -1631,9 +1631,10 @@ ggml_tensor * llm_graph_context::build_moe_prefetch_hint(
 llama_expert_gating_func_type gating_op,
              int64_t   n_expert,
                  int   il) {
-    if (!cpu_sink_runtime || n_tokens != 1 || !next_norm || !next_gate_inp) {
+    if (!cpu_sink_runtime || (n_tokens != 1 && !(arch == LLM_ARCH_DEEPSEEK41 && cpu_sink_decode && n_tokens <= 5)) || !next_norm || !next_gate_inp) {
         return nullptr;
     }
+    if (n_tokens > 1) { ffn_inp = ggml_view_2d(ctx0,ffn_inp,ffn_inp->ne[0],1,ffn_inp->nb[1],0); }
     ggml_tensor * x = build_norm(ffn_inp, next_norm, nullptr, LLM_NORM_RMS, il);
     ggml_tensor * logits = build_lora_mm(next_gate_inp, x);
     ggml_prec_set_acc(logits, GGML_PREC_F32);
@@ -2085,7 +2086,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         descriptor->prefill = cpu_sink_prefill && !descriptor->small_decode;
         descriptor->cache_compute = cache_compute;
         descriptor->routed_scale = execution.routed_scale;
-        ggml_tensor * hint = !cache_compute && !cpu_sink_prefill && n_tokens == 1 ? cpu_sink_prefetch_hint : nullptr;
+        ggml_tensor * hint = !cache_compute && ((!cpu_sink_prefill && n_tokens == 1) || descriptor->small_decode) ? cpu_sink_prefetch_hint : nullptr;
         // slots: input, ids, weights, then the post-expert norm or the native ids and weights, then the hint
         ggml_tensor * args[] = {
             ggml_cont(ctx0, cur), ggml_cont(ctx0, selected_experts), ggml_cont(ctx0, weights),

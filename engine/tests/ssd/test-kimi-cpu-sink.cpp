@@ -3147,6 +3147,10 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
         configure_cache(cached.get(), 6 * unit, { 1, 2 }, 6);
         begin_cache(cached.get(), 41, 1);
         const auto cold = activation_case(inputs, "mxfp4_cache_cold", f, cached.get(), 1, input, top6, w6, clamp, 0, 6);
+        if (!window) {
+            const auto repeated = activation_case(inputs, "mxfp4_cache_same_step_row", f, cached.get(), 1, input, top6, w6, clamp, 6, 0);
+            require(!std::memcmp(cold.data(),repeated.data(),cold.size()*sizeof(float)),"same-step cache hit changed output");
+        }
         begin_cache(cached.get(), 41, 2);
         const auto hit = activation_case(inputs, "mxfp4_cache_full_hit", f, cached.get(), 1, input, top6, w6, clamp, 6, 0);
         require(!std::memcmp(cold.data(), uncached.data(), cold.size() * sizeof(float)) &&

@@ -1827,7 +1827,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ubatch.n_seq_id[0] == 1 && ubatch.pos[0] >= 0;
         auto * registry = backend_cpu ? ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)) : nullptr;
         cpu_sink_runtime->begin(registry, cache_decode ? static_cast<uint64_t>(ubatch.pos[0]) : 0,
-            cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0);
+            cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0, model.dspark != nullptr);
     }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
     if (status != GGML_STATUS_SUCCESS) {
@@ -4858,7 +4858,7 @@ int32_t llama_context::dspark_draft(const float * features, const llama_pos * po
     }
     const int64_t t_compute = ggml_time_us();
     res->set_inputs(&ub);
-    cpu_sink_runtime->begin(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)), ordered.back()+1, true);
+    cpu_sink_runtime->begin(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)), ordered.back()+1, true, 0, true);
     if (graph_compute(graph, true) != GGML_STATUS_SUCCESS) { discard_failed_graph(); return 0; }
     synchronize();
     std::vector<float> values(k*model.vocab.n_tokens());
