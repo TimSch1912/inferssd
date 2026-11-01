@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <map>
 #include <stdexcept>
 #include <vector>
 
@@ -45,6 +47,60 @@ int main(int argc, char ** argv) {
             std::vector<llama_token> known = {llama_token(std::max_element(prefix_logits.begin(),prefix_logits.end())-prefix_logits.begin())};
             std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx,0,flags));
             require(llama_state_seq_get_data_ext(ctx,state.data(),state.size(),0,flags)==state.size(),"snapshot failed");
+            if (std::getenv("DSPARK_UNDO_CANARY")) {
+                auto restore = [&] { require(llama_state_seq_set_data_ext(ctx,state.data(),state.size(),0,flags)==state.size(),"restore failed"); };
+                std::vector<llama_token> inputs = {known[0]};
+                for (int i = 1; i < 5; ++i) { inputs.push_back(text[(n+i)%text.size()]); }
+                std::map<int,std::pair<std::vector<float>,std::vector<float>>> references;
+                // k=1..4, every retained prefix, including full acceptance.
+                for (int batch_size = 2; batch_size <= 5; ++batch_size) {
+                for (int keep = 1; keep <= batch_size; ++keep) {
+                    auto sequential = [&] {
+                        restore();
+                        for (int i = 0; i < keep; ++i) { std::vector<llama_token> one{inputs[i]}; decode(one,n+i); }
+                        std::vector<llama_token> probe{text[(n+7)%text.size()]}; decode(probe,n+keep);
+                        return logits();
+                    };
+                    auto & saved = references[keep];
+                    if (saved.first.empty()) { saved.first=sequential();saved.second=sequential(); }
+                    const auto & reference=saved.first; const auto & control=saved.second;
+                    restore();
+                    require(llama_dspark_undo_begin(ctx),"undo begin failed");
+                    std::vector<llama_token> verifier(inputs.begin(),inputs.begin()+batch_size);
+                    decode(verifier,n);
+                    require(llama_dspark_undo_end(ctx,keep != batch_size),"undo end failed");
+                    if (keep != batch_size) {
+                        for (int i=0;i<keep;++i) { std::vector<llama_token> one{inputs[i]}; decode(one,n+i); }
+                    }
+                    std::vector<llama_token> probe{text[(n+7)%text.size()]}; decode(probe,n+keep);
+                    const auto actual = logits();
+                    double mean=0, control_mean=0; float maximum=0, control_max=0;
+                    for (int i=0;i<width;++i) {
+                        const auto d=std::abs(reference[i]-actual[i]), c=std::abs(reference[i]-control[i]);
+                        require(std::isfinite(actual[i]),"nonfinite canary logit");
+                        mean+=d; control_mean+=c; maximum=std::max(maximum,d); control_max=std::max(control_max,c);
+                    }
+                    mean/=width; control_mean/=width;
+                    std::printf("MODEL_UNDO tokens=%d batch=%d keep=%d max_delta=%.9g mean_delta=%.9g control_max=%.9g control_mean=%.9g\n",
+                        n,batch_size,keep,maximum,mean,control_max,control_mean); std::fflush(stdout);
+                    // Mixed-tier placement changes arithmetic. Bound both average drift and outliers;
+                    // retain the independently repeated sequential control alongside every comparison.
+                    if (keep != batch_size) {
+                        require(mean < 0.02 && maximum < 0.25,"undo continuation outside normal numerical tolerance");
+                    } else {
+                        // No undo on full acceptance. Isolate ordinary multi-token arithmetic from undo:
+                        // compare the committed batch with a fresh batch using exactly the same inputs.
+                        restore(); decode(verifier,n); decode(probe,n+keep); const auto fresh=logits();
+                        double gap=0; float worst=0;
+                        for (int i=0;i<width;++i) { const auto d=std::abs(fresh[i]-actual[i]);gap+=d;worst=std::max(worst,d); }
+                        gap/=width;
+                        printf("MODEL_FULL_ACCEPT tokens=%d batch=%d fresh_max=%.9g fresh_mean=%.9g\n",n,batch_size,worst,gap);fflush(stdout);
+                        require(gap < 0.02 && worst < 0.25,"full-accept state differs from fresh batch");
+                    }
+                }
+                }
+                continue;
+            }
             decode(known,n); const auto reference = logits();
             auto restore = [&] { require(llama_state_seq_set_data_ext(ctx,state.data(),state.size(),0,flags)==state.size(),"restore failed"); };
             for (bool dirty : {false,true}) {

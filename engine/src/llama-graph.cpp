@@ -2081,7 +2081,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         descriptor->post_exp_norm = execution.post_norm;
         descriptor->post_exp_norm_eps = execution.post_norm_eps;
         descriptor->layer = il;
-        descriptor->prefill = cpu_sink_prefill;
+        descriptor->small_decode = arch == LLM_ARCH_DEEPSEEK41 && cpu_sink_decode && cpu_sink_prefill && n_tokens <= 5;
+        descriptor->prefill = cpu_sink_prefill && !descriptor->small_decode;
         descriptor->cache_compute = cache_compute;
         descriptor->routed_scale = execution.routed_scale;
         ggml_tensor * hint = !cache_compute && !cpu_sink_prefill && n_tokens == 1 ? cpu_sink_prefetch_hint : nullptr;

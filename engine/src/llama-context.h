@@ -150,7 +150,7 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
     size_t nextn_width() const;
-    llama_token dspark_draft(const float * features, const llama_pos * positions, int32_t n_context, llama_token known);
+    int32_t dspark_draft(const float * features, const llama_pos * positions, int32_t n_context, llama_token known, llama_token * drafts, int32_t k);
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
     float * get_embeddings_layer_inp(uint32_t lid);

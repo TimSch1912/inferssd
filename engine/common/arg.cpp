@@ -3606,11 +3606,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
     add_opt(common_arg({"--mtp-sidecar"}, "PATH",
-        "enable DeepSeek-V4.1 DSpark (requires --ssd-vram-budget 0; default: off)",
+        "enable DeepSeek-V4.1 DSpark fast mode (default: off)",
         [](common_params & p, const std::string & path) {
             p.speculative.mtp_sidecar = path;
             p.speculative.type = COMMON_SPECULATIVE_TYPE_DSPARK;
         }).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg({"--mtp-mode"}, "fast|strict", "DSpark verification mode (default: fast)",
+        [](common_params & p, const std::string & v) {
+            if (v != "fast" && v != "strict") { throw std::invalid_argument("mtp-mode must be fast or strict"); }
+            p.speculative.mtp_strict = v == "strict";
+        }).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg({"--mtp-drafts"}, "N", "DSpark draft positions, 1..4 (default: 4)",
+        [](common_params & p, int n) {
+            if (n < 1 || n > 4) { throw std::invalid_argument("mtp-drafts must be 1..4"); }
+            p.speculative.mtp_drafts = n;
+        }).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--spec-draft-model", "-md", "--model-draft"}, "FNAME",
         "draft model for speculative decoding (default: unused)",

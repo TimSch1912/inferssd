@@ -783,6 +783,7 @@ static void ggml_backend_cuda_graph_cache_begin_phase(ggml_backend_t backend, in
     ggml_cuda_set_device(cuda_ctx->device);
 
     cuda_ctx->graph_cache_phase = phase;
+    cuda_ctx->decode_pool_reserve = phase == 2 ? cuda_ctx->pool().capacity() : 0;
     cuda_ctx->graph_cache_generation++;
     cuda_ctx->graph_cache_next_ordinal = 0;
     cuda_ctx->graph_cache_phase_swept = false;
@@ -2864,6 +2865,17 @@ static ggml_cuda_mul_mat_kernel ggml_cuda_mul_mat_select(
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
+    }
+
+    // Small routing batches explicitly request F32 accumulation. The MMA path rounds
+    // their F32 activations to BF16, changing expert selection relative to vector decode.
+    // The existing multi-column vector kernel preserves the requested input precision.
+    if (!split && dst->op_params[0] == GGML_PREC_F32 && src1->ne[1] <= 5 &&
+            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            ggml_cuda_should_use_mmvf(src0->type,ggml_cuda_info().devices[ctx.device].cc,src0->ne,src0->nb,1)) {
+        use_mul_mat_vec_f = true;
+        use_mul_mat_f = false;
     }
 
     // debug helpers
@@ -5699,9 +5711,13 @@ static bool ggml_backend_cuda_graph_reserve(ggml_backend_t backend, ggml_cgraph 
     }
 
     ggml_cuda_pool & pool = cuda_ctx->pool();
+    // Draft and verifier graphs alternate within decode. Releasing the verifier's scratch
+    // for a smaller draft lets the expert tier occupy it, then the next verifier cannot grow.
+    if (cuda_ctx->graph_cache_phase == 2) { size = std::max(size,cuda_ctx->decode_pool_reserve); }
     if (!pool.reserve(size)) {
         return false;
     }
+    if (cuda_ctx->graph_cache_phase == 2) { cuda_ctx->decode_pool_reserve = pool.capacity(); }
 #ifdef USE_CUDA_GRAPH
     // a captured graph that reaches past the end of the pool would replay onto released memory
     for (auto it = cuda_ctx->cuda_graphs.begin(); it != cuda_ctx->cuda_graphs.end(); ) {

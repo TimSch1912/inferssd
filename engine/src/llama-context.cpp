@@ -12,6 +12,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-dspark.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -198,9 +199,8 @@ llama_context::llama_context(
             cparams.n_seq_max != 1 || cparams.n_ubatch < 5)) {
         throw std::runtime_error("DSpark requires main SSD expert sources, --parallel 1 and --ubatch-size >= 5");
     }
-    // ponytail: fixed CPU expert arithmetic until the mixed GPU chain has same-seed parity.
-    if (model.dspark && ssd_runtime->settings.vram_budget()->tier_bytes(true) != 0) {
-        throw std::runtime_error("DSpark correctness mode requires --ssd-vram-budget 0; mixed CPU/GPU experts change seeded samples");
+    if (model.dspark && params.mtp_strict && ssd_runtime->settings.vram_budget()->tier_bytes(true) != 0) {
+        throw std::runtime_error("DSpark strict mode requires --ssd-vram-budget 0");
     }
     dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {
@@ -572,12 +572,12 @@ void llama_context::dense_graph_cache_end_phase() {
     dense_gpu_scheduler_graph_phase = 0;
 }
 
-static uint32_t kimi_cpu_sink_reserve_tokens(const llama_cparams & params, bool decode) {
+static uint32_t kimi_cpu_sink_reserve_tokens(const llama_cparams & params, bool decode, uint32_t decode_tokens) {
     // CPU sink only executes one token at a time. Reserving the ubatch-sized
     // fallback graph during decode needlessly allocates GPU expert workspace.
     // Keep the configured ubatch intact so the next prefill is unchanged.
     if (decode && params.n_seq_max == 1) {
-        return 1;
+        return decode_tokens;
     }
     return std::min(params.n_ctx, params.n_ubatch);
 }
@@ -626,7 +626,7 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = kimi_cpu_sink_reserve_tokens(cparams,
-        cpu_sink_enabled && cpu_sink_decode_active && !cparams.warmup);
+        cpu_sink_enabled && cpu_sink_decode_active && !cparams.warmup, model.dspark ? 5u : 1u);
     if (n_tokens < std::min(cparams.n_ctx, cparams.n_ubatch)) {
         LLAMA_LOG_INFO("[kimi_cpu_sink_decode_reserve] tokens=%u configured_ubatch=%u\n",
             n_tokens, cparams.n_ubatch);
@@ -1016,11 +1016,12 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     const uint32_t prefill_horizon = !reserve_horizon_enabled ? 0 :
         requested_tokens ? (GGML_PAD(requested_tokens, 256u) < cparams.n_ctx ? GGML_PAD(requested_tokens, 256u) : 0) :
         reserve_horizon_bucket(memory_n_pos() + reserve_horizon_min);
+    const uint32_t decode_tokens = model.dspark ? 5u : 1u;
     auto reserve_ubatch = [&](uint32_t ubatch) {
         cparams.n_ubatch = ubatch;
         drop_scheduler();
         if (cpu_prefill_output_sizing_enabled) {
-            sched_reserve_n_outputs = cparams.n_seq_max;
+            sched_reserve_n_outputs = active ? cparams.n_seq_max : std::max(cparams.n_seq_max,decode_tokens);
         }
         sched_reserve_n_ctx = active && ubatch > 1 ? prefill_horizon :
             reserve_horizon_bucket(memory_n_pos() + 1);
@@ -1089,7 +1090,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             }
 
             cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
-            const bool decode_restored = reserve_ubatch(1);
+            const bool decode_restored = reserve_ubatch(decode_tokens);
             cpu_prefill_selected_ubatch = 0;
             complete_vram_phase(decode_restored);
             LLAMA_LOG_ERROR(
@@ -1101,13 +1102,13 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         }
 
         if (!cpu_prefill_actual_shape_active) {
-            const bool reserved = !phase_changed || reserve_ubatch(1);
+            const bool reserved = !phase_changed || reserve_ubatch(decode_tokens);
             const bool vram_complete = complete_vram_phase(reserved);
             return reserved && vram_complete;
         }
         const uint32_t released = cpu_prefill_selected_ubatch;
         cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
-        const bool graph_restored = reserve_ubatch(1);
+        const bool graph_restored = reserve_ubatch(decode_tokens);
         cpu_prefill_actual_shape_active = false;
         cpu_prefill_selected_ubatch = 0;
         const bool vram_complete = complete_vram_phase(graph_restored);
@@ -1212,7 +1213,7 @@ bool llama_context::memory_update(bool optimize) {
 
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = kimi_cpu_sink_reserve_tokens(cparams,
-            cpu_sink_enabled && cpu_sink_decode_active && !cparams.warmup);
+            cpu_sink_enabled && cpu_sink_decode_active && !cparams.warmup, model.dspark ? 5u : 1u);
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
         if (!gf) {
@@ -1822,7 +1823,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_synchronize(sched.get());
         const bool cache_decode = cpu_sink_cache_batch_decode &&
             gtype == LLM_GRAPH_TYPE_DECODER && !res->cpu_sink_nodes.empty() &&
-            ubatch.n_tokens == 1 && ubatch.n_seqs_unq == 1 &&
+            ubatch.n_tokens <= (model.dspark ? 5u : 1u) && ubatch.n_seqs_unq == 1 &&
             ubatch.n_seq_id[0] == 1 && ubatch.pos[0] >= 0;
         auto * registry = backend_cpu ? ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)) : nullptr;
         cpu_sink_runtime->begin(registry, cache_decode ? static_cast<uint64_t>(ubatch.pos[0]) : 0,
@@ -2211,7 +2212,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     cpu_sink_cache_batch_decode = cpu_sink_enabled && cpu_sink_decode_active &&
-        !cparams.warmup && n_tokens_all == 1;
+        !cparams.warmup && (n_tokens_all == 1 || (model.dspark && n_tokens_all <= 5));
     const bool cpu_sink_non_decode_phase = !cpu_sink_cache_batch_decode && cpu_sink_runtime &&
         (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget);
 
@@ -2290,7 +2291,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        // The prefill lifecycle restores a one-token decode reserve. DSpark verification
+        // must remain one ubatch so compressor plans and the bounded undo share one write set.
+        const uint32_t decode_ubatch = model.dspark && n_tokens_all <= 5 ? std::max(5u,cparams.n_ubatch) : cparams.n_ubatch;
+        mctx = memory->init_batch(*balloc, decode_ubatch, output_all);
         if (!mctx) {
             return -2;
         }
@@ -4065,6 +4069,7 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
         /*.ssd_options                 =*/ nullptr,
+        /*.mtp_strict                  =*/ false,
     };
 
     return result;
@@ -4818,15 +4823,15 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
     return ctx->memory_breakdown();
 }
 
-llama_token llama_context::dspark_draft(const float * features, const llama_pos * positions, int32_t count, llama_token known) {
+int32_t llama_context::dspark_draft(const float * features, const llama_pos * positions, int32_t count, llama_token known, llama_token * drafts, int32_t k) {
     if (!model.dspark || !features || !positions || count < 1 || count > 128 ||
-        known < 0 || known >= model.vocab.n_tokens() || !cpu_sink_runtime || !loras->empty()) {
-        return LLAMA_TOKEN_NULL;
+        !drafts || k < 1 || k > 4 || known < 0 || known >= model.vocab.n_tokens() || !cpu_sink_runtime || !loras->empty()) {
+        return 0;
     }
     std::vector<llama_pos> ordered(positions,positions+count);
     std::sort(ordered.begin(),ordered.end());
     for (int i = 0; i < count; ++i) {
-        if (ordered[i] < 0 || (i && ordered[i] != ordered[i-1]+1)) { return LLAMA_TOKEN_NULL; }
+        if (ordered[i] < 0 || (i && ordered[i] != ordered[i-1]+1)) { return 0; }
     }
     synchronize();
     auto * res = gf_res_prev.get();
@@ -4841,28 +4846,55 @@ llama_token llama_context::dspark_draft(const float * features, const llama_pos 
     ub.n_tokens = ub.n_seq_tokens = 5; ub.n_seqs = ub.n_seqs_unq = ub.n_pos = ub.b_equal_seqs = 1;
     ub.token = tokens; ub.pos = pos; ub.n_seq_id = ns; ub.seq_id = ids;
     ub.seq_id_unq = &seq; ub.seq_idx = seq_idx; ub.output = output;
-    llama_dspark_input input{features, positions, count, known};
+    llama_dspark_input input{features, positions, count, known, k};
     auto gp = graph_params(res, ub, nullptr, LLM_GRAPH_TYPE_DECODER);
-    gp.cpu_sink_prefill = true; gp.cpu_sink_decode = false; gp.n_outputs = 1; gp.samplers.clear(); gp.dspark = &input;
+    gp.cpu_sink_prefill = true; gp.cpu_sink_decode = true; gp.n_outputs = k; gp.samplers.clear(); gp.dspark = &input;
+    const int64_t t_build = ggml_time_us();
     auto * graph = model.build_graph(gp);
+    const int64_t t_alloc = ggml_time_us();
     // Every draft goes through the same admission and expert runtime as the main graph.
-    if (!reserve_compute_graph(graph, true) || !ggml_backend_sched_alloc_prepared(sched.get(), graph)) {
-        discard_failed_graph(); return LLAMA_TOKEN_NULL;
+    if (!reserve_compute_graph(graph, false) || !ggml_backend_sched_alloc_prepared(sched.get(), graph)) {
+        discard_failed_graph(); return 0;
     }
+    const int64_t t_compute = ggml_time_us();
     res->set_inputs(&ub);
-    cpu_sink_runtime->begin(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)), 0, false);
-    if (graph_compute(graph, true) != GGML_STATUS_SUCCESS) { discard_failed_graph(); return LLAMA_TOKEN_NULL; }
+    cpu_sink_runtime->begin(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)), ordered.back()+1, true);
+    if (graph_compute(graph, true) != GGML_STATUS_SUCCESS) { discard_failed_graph(); return 0; }
     synchronize();
-    std::vector<float> values(model.vocab.n_tokens());
+    std::vector<float> values(k*model.vocab.n_tokens());
     ggml_backend_tensor_get(res->t_logits, values.data(), 0, values.size()*sizeof(float));
     if (!std::all_of(values.begin(), values.end(), [](float x) { return std::isfinite(x); })) {
         throw std::runtime_error("DSpark produced non-finite logits");
     }
-    return std::max_element(values.begin(), values.end()) - values.begin();
+    for (int i = 0; i < k; ++i) {
+        const auto first = values.begin()+i*model.vocab.n_tokens();
+        drafts[i] = std::max_element(first, first+model.vocab.n_tokens())-first;
+    }
+    LLAMA_LOG_INFO("DSpark draft profile: k=%d build_ms=%.3f alloc_ms=%.3f compute_read_ms=%.3f\n",
+        k,(t_alloc-t_build)/1e3,(t_compute-t_alloc)/1e3,(ggml_time_us()-t_compute)/1e3);
+    return k;
+}
+
+int32_t llama_dspark_draft_n(llama_context * ctx, const float * features, const llama_pos * positions,
+        int32_t count, llama_token known, llama_token * drafts, int32_t k) {
+    try { return ctx->dspark_draft(features, positions, count, known, drafts, k); }
+    catch (const std::exception & e) { LLAMA_LOG_ERROR("DSpark draft failed: %s\n", e.what()); return 0; }
 }
 
 llama_token llama_dspark_draft(llama_context * ctx, const float * features, const llama_pos * positions,
         int32_t count, llama_token known) {
-    try { return ctx->dspark_draft(features, positions, count, known); }
-    catch (const std::exception & e) { LLAMA_LOG_ERROR("DSpark draft failed: %s\n", e.what()); return LLAMA_TOKEN_NULL; }
+    llama_token token = LLAMA_TOKEN_NULL;
+    llama_dspark_draft_n(ctx,features,positions,count,known,&token,1);
+    return token;
+}
+
+bool llama_dspark_undo_begin(llama_context * ctx) {
+    ctx->synchronize();
+    auto * cache = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(ctx));
+    return cache && cache->undo_begin();
+}
+bool llama_dspark_undo_end(llama_context * ctx, bool restore) {
+    ctx->synchronize();
+    auto * cache = dynamic_cast<llama_kv_cache_dsv4 *>(llama_get_memory(ctx));
+    return cache && cache->undo_end(restore);
 }

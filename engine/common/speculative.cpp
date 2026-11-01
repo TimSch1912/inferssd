@@ -188,7 +188,7 @@ struct common_speculative_state_dspark : common_speculative_state {
         while (history.size() > 256) { history.erase(history.begin()); }
         return true;
     }
-    void draft(const common_params_speculative &, const llama_tokens & prompt, llama_token known,
+    void draft(const common_params_speculative & params, const llama_tokens & prompt, llama_token known,
             llama_tokens & result) override {
         if (prompt.size() < 2 || history.empty()) { return; }
         const llama_pos last = prompt.size()-1;
@@ -202,11 +202,13 @@ struct common_speculative_state_dspark : common_speculative_state {
             if (it == history.end()) { return; } // e.g. a disk prompt-cache hit: wait for a complete new window.
             positions.push_back(p); features.insert(features.end(),it->second.begin(),it->second.end());
         }
-        const auto token = llama_dspark_draft(ctx, features.data(), positions.data(), positions.size(), known);
-        if (token != LLAMA_TOKEN_NULL) { result.push_back(token); }
+        llama_token tokens[4];
+        const int n = llama_dspark_draft_n(ctx, features.data(), positions.data(), positions.size(), known, tokens,
+            params.mtp_strict ? 1 : params.mtp_drafts);
+        result.assign(tokens,tokens+n);
     }
     void accept(uint16_t) override {}
-    int32_t n_max(const common_params_speculative &) const override { return 1; }
+    int32_t n_max(const common_params_speculative & p) const override { return p.mtp_strict ? 1 : p.mtp_drafts; }
     int32_t n_min(const common_params_speculative &) const override { return 1; }
 };
 

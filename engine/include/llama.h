@@ -388,6 +388,7 @@ extern "C" {
 
         // Optional immutable SSD extension; copied during context creation.
         const struct llama_ssd_options * ssd_options;
+        bool mtp_strict; // require fixed CPU experts for the DSpark strict check mode
     };
 
     struct llama_model_tensor_override {
@@ -442,7 +443,13 @@ extern "C" {
     // Opt-in DSpark sidecar; call before creating any contexts. Failure leaves the model unchanged.
     LLAMA_API bool llama_model_load_mtp_sidecar(struct llama_model * model, const char * path);
     LLAMA_API bool llama_model_has_mtp_sidecar(const struct llama_model * model);
-    // Draft one token from up to 128 committed features, each 3*n_embd floats, with their absolute positions.
+    // Draft up to four tokens from committed features, each 3*n_embd floats.
+    LLAMA_API int32_t llama_dspark_draft_n(struct llama_context * ctx, const float * features,
+        const llama_pos * positions, int32_t n_context, llama_token known, llama_token * drafts, int32_t k);
+    // Single-stream DSv4 append transaction, at most five inputs in one ubatch.
+    LLAMA_API bool llama_dspark_undo_begin(struct llama_context * ctx);
+    LLAMA_API bool llama_dspark_undo_end(struct llama_context * ctx, bool restore);
+    // Compatibility one-token entry point.
     LLAMA_API llama_token llama_dspark_draft(struct llama_context * ctx, const float * features,
         const llama_pos * positions, int32_t n_context, llama_token known);
 

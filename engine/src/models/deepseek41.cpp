@@ -1365,12 +1365,17 @@ void llm_build_deepseek41::build_dspark(const llama_dspark_input & input) {
         stream = build_hc_post(ggml_add(ctx0, experts, shared), residual, post, comb, il);
     }
     auto * hidden = build_hc_pre(stream, pre_mix, -1);
-    // The other hidden positions participate in attention, but their output heads cannot affect proposal #1.
-    hidden = ggml_view_2d(ctx0, hidden, n_embd, 1, hidden->nb[1], 0);
-    auto * logits = ggml_mul_mat(ctx0, model.output, build_norm(hidden, mtp.norm, nullptr, LLM_NORM_RMS, -1));
-    auto * known = ggml_view_1d(ctx0, res->t_inp_tokens, 1, 0);
-    auto * markov = ggml_get_rows(ctx0, mtp.markov_embd, known);
-    logits = ggml_add(ctx0, logits, ggml_mul_mat(ctx0, mtp.markov_output, markov));
+    hidden = ggml_view_2d(ctx0, hidden, n_embd, input.n_drafts, hidden->nb[1], 0);
+    auto * base = ggml_mul_mat(ctx0, model.output, build_norm(hidden, mtp.norm, nullptr, LLM_NORM_RMS, -1));
+    auto * previous = ggml_view_1d(ctx0, res->t_inp_tokens, 1, 0);
+    ggml_tensor * logits = nullptr;
+    for (int i = 0; i < input.n_drafts; ++i) {
+        auto * row = ggml_view_2d(ctx0, base, base->ne[0], 1, base->nb[1], i*base->nb[1]);
+        auto * markov = ggml_get_rows(ctx0, mtp.markov_embd, previous);
+        row = ggml_add(ctx0, row, ggml_mul_mat(ctx0, mtp.markov_output, markov));
+        previous = ggml_argmax(ctx0, row);
+        logits = logits ? ggml_concat(ctx0, logits, row, 1) : row;
+    }
     cb(logits, "dspark_logits", -1);
     res->t_logits = logits;
     ggml_set_output(logits);

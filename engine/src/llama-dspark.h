@@ -25,4 +25,5 @@ struct llama_dspark_input {
     const llama_pos * positions;
     int32_t n_context;
     llama_token known;
+    int32_t n_drafts;
 };

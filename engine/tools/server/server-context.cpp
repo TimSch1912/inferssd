@@ -411,12 +411,15 @@ struct server_slot {
 
                 if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                     const auto n_tokens = prompt.tokens.size();
+                    if (llama_model_has_mtp_sidecar(llama_get_model(ctx)) && !params_spec.mtp_strict) {
+                        if (!llama_dspark_undo_begin(ctx)) { throw std::runtime_error("failed to begin DSpark undo"); }
+                    } else {
+                        spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens, -1, -1,
+                            llama_model_has_mtp_sidecar(llama_get_model(ctx)) ? LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                    spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens, -1, -1,
-                        llama_model_has_mtp_sidecar(llama_get_model(ctx)) ? LLAMA_STATE_SEQ_FLAGS_EXACT_LAYOUT : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                    SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
-                            spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
+                        SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
+                                spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
+                    }
                 }
 
                 if (spec_draft.empty()) {
@@ -2247,8 +2250,44 @@ private:
         return true;
     }
 
-    // DSpark correctness milestone: audit the batched verifier, then restore before consuming target RNG.
-    // ponytail: sequential decisions preserve ordinary sampling; enable a batch fast path only after logit parity.
+    llama_tokens verify_dspark_fast(server_slot & slot, std::vector<completion_token_output> & outputs) {
+        llama_tokens accepted;
+        for (size_t i = 0; i <= slot.spec_draft.size(); ++i) {
+            const auto row = slot.spec_i_batch[i];
+            const auto token = common_sampler_sample(slot.smpl.get(),slot.ctx,row);
+            common_sampler_accept(slot.smpl.get(),token,true);
+            completion_token_output out;
+            out.tok = token; out.prob = 1.0f;
+            if (slot.task->params.sampling.n_probs > 0) {
+                populate_token_probs(slot,out,slot.task->params.post_sampling_probs,params_base.special,row);
+            }
+            outputs.push_back(std::move(out)); accepted.push_back(token);
+            if (llama_vocab_is_eog(vocab,token) || i == slot.spec_draft.size() || token != slot.spec_draft[i]) { break; }
+        }
+        const bool reject = accepted.size() != slot.spec_draft.size()+1;
+        if (!llama_dspark_undo_end(slot.ctx,reject)) { throw std::runtime_error("failed DSpark delta undo"); }
+        const size_t prefix = slot.prompt.tokens.size()-slot.spec_draft.size()-1;
+        const llama_pos pos0 = slot.prompt.tokens.pos_next()-slot.spec_draft.size()-1;
+        slot.prompt.tokens.keep_first(prefix);
+        slot.prompt.tokens.push_back(slot.sampled);
+        slot.prompt.tokens.insert({accepted.begin(),accepted.end()-1});
+        if (reject) {
+            // No target re-decision: only rebuild state for the already chosen input prefix.
+            auto replay = llama_batch_init(1,0,1);
+            bool ok = true;
+            for (size_t i = 0; i < accepted.size() && ok; ++i) {
+                common_batch_clear(replay);
+                common_batch_add(replay,i ? accepted[i-1] : slot.sampled,pos0+i,{slot.id},false);
+                ok = llama_decode(slot.ctx,replay) == 0 && common_speculative_process(slot.spec.get(),replay,slot.id);
+                if (ok) { metrics.on_decoded(slots); }
+            }
+            llama_batch_free(replay);
+            if (!ok) { throw std::runtime_error("failed DSpark committed-prefix replay"); }
+        }
+        return accepted;
+    }
+
+    // Strict check mode: full state restore and sequential target decisions before RNG consumption.
     llama_tokens verify_dspark(server_slot & slot, std::vector<completion_token_output> & outputs) {
         const auto & ckpt = slot.spec_ckpt;
         const int n_vocab = llama_vocab_n_tokens(vocab);
@@ -3554,10 +3593,11 @@ private:
                     }
 
                     const int64_t t_dspark_start = ggml_time_us();
-                    auto accepted = dspark ? verify_dspark(slot,dspark_outputs) :
+                    auto accepted = dspark ? (slot.task->params.speculative.mtp_strict ? verify_dspark(slot,dspark_outputs) :
+                        verify_dspark_fast(slot,dspark_outputs)) :
                         common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
                     if (dspark) {
-                        spec_recomputed = true;
+                        spec_recomputed = slot.task->params.speculative.mtp_strict || accepted.size() < n_draft+1;
                         spec_recompute_ms = (ggml_time_us()-t_dspark_start)/1e3;
                     }
                     slot.spec_i_batch.clear();
@@ -3613,7 +3653,7 @@ private:
                         spec_argmax_matched, spec_argmax_checked, spec_partial,
                         spec_recomputed, spec_recomputed ? ids.size() : 0,
                         slot.t_spec_draft_ms, spec_recompute_ms, spec_step_ms,
-                        llama_model_has_mtp_sidecar(llama_get_model(slot.ctx)) ? "sequential-target" : "batch-verifier");
+                        dspark && slot.task->params.speculative.mtp_strict ? "sequential-target" : "batch-verifier");
                 slot.t_spec_step_start_us = 0;
                 slot.t_spec_draft_ms = 0.0;
 

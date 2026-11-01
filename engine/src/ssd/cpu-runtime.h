@@ -39,6 +39,7 @@ struct llama_kimi_cpu_sink_node {
     bool post_exp_norm = false;
     float post_exp_norm_eps = 0.0f;
     bool prefill = false;
+    bool small_decode = false;
     bool cache_compute = false;
     bool guarded = false;
     float routed_scale = 1.0f;
@@ -403,7 +404,22 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
     }
     const bool situ = node.activation.kind == KIMI_CPU_SINK_ACTIVATION_SITU;
     GGML_ASSERT(situ || !node.cache_compute);
-    if (node.prefill) {
+    if (node.small_decode) {
+        // ponytail: reuse the tier-aware vector executor for <=5 rows; no prefill transition or SSD-only drafts.
+        // Attention and dense operations still run as a single multi-token graph.
+        ok = true;
+        for (int i = 0; i < ntokens && ok; ++i) {
+            kimi_cpu_sink_stats row = {};
+            ok = runtime.run_activation(runtime.sink, &node.up, &node.gate, &node.down,
+                static_cast<const float *>(input->data)+i*node.up.ne[0],
+                static_cast<const int32_t *>(ids->data)+i*nslots,
+                static_cast<const float *>(weights->data)+i*nslots, nslots, &activation,
+                static_cast<float *>(dst->data)+i*node.down.ne[1], &row, error, sizeof(error));
+            stats.read_requests += row.read_requests; stats.read_bytes += row.read_bytes;
+            stats.read_errors += row.read_errors; stats.fallback_count += row.fallback_count;
+            stats.total_us += row.total_us;
+        }
+    } else if (node.prefill) {
         runtime.prefill.initialize(node.cpu_reg, runtime.sink);
         ok = runtime.prefill.run_activation(runtime.prefill.context, &node.up, &node.gate, &node.down,
             static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),

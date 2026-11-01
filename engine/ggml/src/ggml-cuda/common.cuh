@@ -1432,6 +1432,7 @@ struct ggml_backend_cuda_context {
 
     // the largest memory pool need that ggml_backend_cuda_graph_reserve has logged
     size_t pool_reserve_logged = 0;
+    size_t decode_pool_reserve = 0;
 
 #ifdef USE_CUDA_GRAPH
     // The default key remains first_node_ptr.  Phase-managed schedulers use a

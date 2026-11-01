@@ -353,6 +353,8 @@ struct common_params_speculative_ngram_cache {
 
 struct common_params_speculative {
     std::string mtp_sidecar;
+    bool mtp_strict = false;
+    int32_t mtp_drafts = 4;
     // TODO: become a vector in order to support "chains of speculators"
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
 
