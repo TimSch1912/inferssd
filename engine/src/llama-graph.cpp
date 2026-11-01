@@ -1287,6 +1287,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    if (arch == LLM_ARCH_DEEPSEEK41 && cpu_sink_decode && n_tokens <= 5 && !ggml_is_quantized(w->type)) {
+        ggml_prec_set_acc(res,GGML_PREC_F32);
+    }
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);

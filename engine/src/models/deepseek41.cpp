@@ -412,6 +412,7 @@ void llm_build_deepseek41::build_hc_mixes(
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
+    if (model.dspark && cpu_sink_decode && nt <= 5) { ggml_prec_set_acc(mixes,GGML_PREC_F32); }
     cb(mixes, "hc_mixes", il);
 
     ggml_tensor * scale_pre  = dsv41_view_1d(ctx0, hc_scale, 1, 0);
@@ -1283,7 +1284,7 @@ llm_build_deepseek41::llm_build_deepseek41(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -1366,13 +1367,13 @@ void llm_build_deepseek41::build_dspark(const llama_dspark_input & input) {
     }
     auto * hidden = build_hc_pre(stream, pre_mix, -1);
     hidden = ggml_view_2d(ctx0, hidden, n_embd, input.n_drafts, hidden->nb[1], 0);
-    auto * base = ggml_mul_mat(ctx0, model.output, build_norm(hidden, mtp.norm, nullptr, LLM_NORM_RMS, -1));
+    auto * base = build_lora_mm(model.output, build_norm(hidden, mtp.norm, nullptr, LLM_NORM_RMS, -1));
     auto * previous = ggml_view_1d(ctx0, res->t_inp_tokens, 1, 0);
     ggml_tensor * logits = nullptr;
     for (int i = 0; i < input.n_drafts; ++i) {
         auto * row = ggml_view_2d(ctx0, base, base->ne[0], 1, base->nb[1], i*base->nb[1]);
         auto * markov = ggml_get_rows(ctx0, mtp.markov_embd, previous);
-        row = ggml_add(ctx0, row, ggml_mul_mat(ctx0, mtp.markov_output, markov));
+        row = ggml_add(ctx0, row, build_lora_mm(mtp.markov_output, markov));
         previous = ggml_argmax(ctx0, row);
         logits = logits ? ggml_concat(ctx0, logits, row, 1) : row;
     }
